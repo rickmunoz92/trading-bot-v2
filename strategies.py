@@ -76,10 +76,12 @@ class EmaCross(StrategyBase):
         # Seed EMAs with SMA once enough bars have accumulated
         self._maybe_seed_emas()
 
-        # After seeding, update with recursive EMA
-        if self.ema_fast is not None:
+        # IMPORTANT: Do NOT update on the same bar as seeding.
+        # Only start recursive EMA updates AFTER the seed bar.
+        n = len(self.prices)
+        if self.ema_fast is not None and n > self.fast:
             self.ema_fast = self._update_ema(self.ema_fast, px, self.k_fast)
-        if self.ema_slow is not None:
+        if self.ema_slow is not None and n > self.slow:
             self.ema_slow = self._update_ema(self.ema_slow, px, self.k_slow)
 
     def signal(self) -> Dict[str, Any]:
