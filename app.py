@@ -34,6 +34,7 @@ class Config:
     equity: float
     fast: int
     slow: int
+    side: Optional[str]  # "long" | "short" | "both" | None (None => dynamic default)
 
 @dataclass
 class OrderPlan:
@@ -82,6 +83,8 @@ def parse_args() -> Config:
     p.add_argument("--equity", type=float, default=100_000.0, help="only for local paper broker")
     p.add_argument("--fast", type=int, default=9, help="ema fast period")
     p.add_argument("--slow", type=int, default=21, help="ema slow period")
+    p.add_argument("--side", choices=["long", "short", "both"], default=None,
+                   help="Restrict trades to long only, short only, or both. Default: equities=both, crypto=long.")
 
     a = p.parse_args()
     # Support forms: "--strategy ema_cross" or "--strategy ema_cross 9 21"
@@ -108,6 +111,7 @@ def parse_args() -> Config:
         equity=a.equity,
         fast=a.fast,
         slow=a.slow,
+        side=a.side,
     )
 
 
@@ -155,6 +159,7 @@ def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, 
         R.kv("mode", cfg.trade_mode.upper()),
         R.kv("broker", broker.name.upper()),
         R.kv("strategy", format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow)),
+        R.kv("side", (cfg.side or "").upper() or "AUTO"),
         R.kv("Risk", f"${cfg.equity * (cfg.risk_pct/100.0):.2f} ({cfg.risk_pct:.2f}%)"),
         R.kv("poll", f"{cfg.poll}s"),
     ]
@@ -174,6 +179,14 @@ def _strategy_hit(action: Optional[str]) -> bool:
     """Return True when the strategy signaled an actionable entry this bar."""
     return action in ("enter_long", "enter_short")
 
+def _apply_side_filter(action: str, side_pref: str) -> str:
+    """Force long-only or short-only by converting disallowed entries to 'hold'."""
+    if side_pref == "long" and action == "enter_short":
+        return "hold"
+    if side_pref == "short" and action == "enter_long":
+        return "hold"
+    return action
+
 def main() -> None:
     cfg = parse_args()
 
@@ -188,6 +201,13 @@ def main() -> None:
         except Exception as e:
             print(R.warn(f"Falling back to local paper broker: {e}"))
             broker = LocalPaperBroker(equity=cfg.equity)
+
+    # Dynamic default for --side:
+    # - crypto => "long"
+    # - equities => "both"
+    if cfg.side is None:
+        asset_cls = broker.asset_class(cfg.symbol)
+        cfg.side = "long" if asset_cls == "crypto" else "both"
 
     # Graceful, responsive shutdown
     stop_event = threading.Event()
@@ -242,6 +262,9 @@ def main() -> None:
             strategy.ingest(bar)
             signal_out = strategy.signal()
             action = signal_out.get("action", "hold")
+
+            # Apply side preference
+            action = _apply_side_filter(action, cfg.side)
 
             # --- Header (each poll with TP/SL) ---
             print(f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=bar["c"], action=action))
@@ -305,7 +328,7 @@ def main() -> None:
             pass
         try:
             if hasattr(broker, "trading") and hasattr(broker.trading, "close"):
-            # some clients offer close(); ignore if not present
+                # some clients offer close(); ignore if not present
                 broker.trading.close()
         except Exception:
             pass
