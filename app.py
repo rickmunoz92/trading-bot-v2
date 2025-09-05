@@ -48,11 +48,29 @@ class OrderPlan:
     meta: Dict[str, Any]
 
 
-def format_strategy_label(name: str, fast: int, slow: int) -> str:
+def format_strategy_label(name: str, fast: int, slow: int, state: Optional[Dict[str, Any]] = None) -> str:
+    """
+    Render a human-friendly strategy label. If a debug `state` is provided and it
+    contains EMA values, include them inline like:
+        'EMA Cross (9=112770.5455 / 21=112688.6210)'
+    Otherwise, show just the periods:
+        'EMA Cross (9/21)'
+    """
     names = {
         "ema_cross": "EMA Cross",
     }
     label = names.get(name, name.replace("_", " ").title())
+    if state:
+        # Prefer keys 'ema_fast' and 'ema_slow' when present
+        ef = state.get("ema_fast")
+        es = state.get("ema_slow")
+        def _fmt(v):
+            try:
+                return f"{float(v):.4f}"
+            except Exception:
+                return str(v)
+        if ef is not None and es is not None:
+            return f"{label} ({fast}={_fmt(ef)} / {slow}={_fmt(es)})"
     return f"{label} ({fast}/{slow})"
 
 def human_ts(ts: str) -> str:
@@ -150,13 +168,13 @@ def risk_size_qty(equity: float, risk_pct: float, entry: float, stop: float, lot
     steps = int(qty / lot_size)
     return max(0.0, steps * lot_size)
 
-def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, action: str = None) -> str:
+def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, action: str = None, strategy_state: Optional[Dict[str, Any]] = None) -> str:
     kv = [
         R.kv("timeframe", cfg.timeframe),
         R.kv("symbol", cfg.symbol),
         R.kv("mode", cfg.trade_mode.upper()),
         R.kv("broker", broker.name.upper()),
-        R.kv("strategy", format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow)),
+        R.kv("strategy", format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow, strategy_state)),
         R.kv("side", (cfg.side or "").upper() or "AUTO"),
         R.kv("Risk", f"${cfg.equity * (cfg.risk_pct/100.0):.2f} ({cfg.risk_pct:.2f}%)"),
         R.kv("poll", f"{cfg.poll}s"),
@@ -524,7 +542,7 @@ def main() -> None:
                 updated = _enforce_tp_sl_and_maybe_exit(cfg, broker, journal, open_position)
                 open_position = updated
                 if not open_position:
-                    header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=display_price, action=action)
+                    header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=display_price, action=action, strategy_state=getattr(strategy, "debug_state", lambda: {})())
                     line = [
                         R.kv("price", f"{display_price:.4f}"),
                         R.kv("sig", "exit (tp/sl)"),
@@ -552,8 +570,10 @@ def main() -> None:
                     last_bucket_sec = bucket_now
                     prev_bar = bar_now
 
-            # --- Header ---
-            header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=display_price, action=action)
+            # --- Header (now includes strategy EMA values when available) ---
+            header = f"{human_ts(now_utc_iso())} " + format_header(
+                cfg, broker, current_price=display_price, action=action, strategy_state=getattr(strategy, "debug_state", lambda: {})()
+            )
 
             # --- Status line ---
             line = [
@@ -613,7 +633,7 @@ def main() -> None:
                         when=now_utc_iso(),
                         symbol=cfg.symbol,
                         asset_class=broker.asset_class(cfg.symbol),
-                        strategy=format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow),
+                        strategy=format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow, getattr(strategy, "debug_state", lambda: {})()),
                         entry_price=plan.entry,
                         stop_loss=plan.stop_loss,
                         take_profit=plan.take_profit,

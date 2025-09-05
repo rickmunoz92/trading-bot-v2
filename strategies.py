@@ -8,6 +8,10 @@ class StrategyBase:
         # {action: 'enter_long'|'enter_short'|'exit'|'hold'}
         raise NotImplementedError
 
+    # Optional: strategy-specific debug state for console rendering
+    def debug_state(self) -> Dict[str, Any]:
+        return {}
+
 class EmaCross(StrategyBase):
     """
     Symmetric EMA cross strategy that enters ONLY on the bar where the cross occurs.
@@ -84,6 +88,15 @@ class EmaCross(StrategyBase):
         # Update prev_rel when no action fired.
         self.prev_rel = rel_now
         return {"action": "hold"}
+
+    def debug_state(self) -> Dict[str, Any]:
+        # Expose current EMA values for console rendering
+        return {
+            "ema_fast": self.ema_fast,
+            "ema_slow": self.ema_slow,
+            "rel": (None if self.ema_fast is None or self.ema_slow is None else (1 if self.ema_fast > self.ema_slow else -1 if self.ema_fast < self.ema_slow else 0)),
+            "pos_dir": self.pos_dir,
+        }
 
 def get_strategy(name: str):
     REG = {
