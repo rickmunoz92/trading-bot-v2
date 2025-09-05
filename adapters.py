@@ -1,3 +1,4 @@
+
 import os
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List
@@ -90,6 +91,11 @@ class BrokerBase:
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
 
+    # NEW: most recent trade
+    def get_latest_trade(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Return {'t': iso_ts, 'p': price, 's': size} for the most recent trade."""
+        raise NotImplementedError
+
     # NEW: historical backfill
     def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
         """Return up to `limit` most recent CLOSED bars, oldest→newest. Each bar is {t,o,h,l,c,v} with t as ISO8601."""
@@ -133,6 +139,11 @@ class LocalPaperBroker(BrokerBase):
         self._last_price[symbol] = new
         iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         return {"t": iso, "o": last, "h": max(last, new), "l": min(last, new), "c": new, "v": 1000}
+
+    def get_latest_trade(self, symbol: str) -> Optional[Dict[str, Any]]:
+        # Use the same generator as bars for a simple latest trade
+        bar = self.get_latest_bar(symbol, "1m")
+        return {"t": bar["t"], "p": float(bar["c"]), "s": 1.0}
 
     def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
         # Generate synthetic closed bars
@@ -246,6 +257,20 @@ class AlpacaBroker(BrokerBase):
             "c": float(bar.close),
             "v": float(bar.volume or 0),
         }
+
+    def get_latest_trade(self, symbol: str) -> Optional[Dict[str, Any]]:
+        # Return the most recent trade (matches Alpaca UI "Last Trade" better than bar close)
+        if _is_crypto_symbol(symbol):
+            from alpaca.data.requests import CryptoLatestTradeRequest
+            sym = _to_alpaca_crypto_data_symbol(symbol)  # e.g., BTC/USD
+            req = CryptoLatestTradeRequest(symbol_or_symbols=sym)
+            tr = self.crypto_data.get_crypto_latest_trade(req)[sym]
+        else:
+            from alpaca.data.requests import StockLatestTradeRequest
+            sym = _normalize_symbol(symbol)              # e.g., AAPL
+            req = StockLatestTradeRequest(symbol_or_symbols=sym)
+            tr = self.stock_data.get_stock_latest_trade(req)[sym]
+        return {"t": tr.timestamp.isoformat(), "p": float(tr.price), "s": float(getattr(tr, "size", 0) or 0)}
 
     def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
         # Fetch most recent CLOSED bars, oldest→newest
@@ -432,6 +457,9 @@ class IbkrBroker(BrokerBase):
         return None
 
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
+        return None
+
+    def get_latest_trade(self, symbol: str) -> Optional[Dict[str, Any]]:
         return None
 
     def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
