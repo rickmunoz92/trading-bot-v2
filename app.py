@@ -1,3 +1,4 @@
+
 import re
 
 import argparse
@@ -370,16 +371,17 @@ def main() -> None:
         # Use up to 60% of poll interval for live data calls (never < 2s, never > 6s)
         return max(2.0, min(6.0, cfg.poll * 0.6))
 
+    # DISPLAY price: use latest TRADE (matches Alpaca UI). Signals still use CLOSED bars.
     def price_fetch() -> Optional[float]:
         try:
-            bar = _retry_broker(
-                stop_event, responsive_sleep, "get_latest_bar",
-                broker.get_latest_bar, cfg.symbol, cfg.timeframe,
+            tr = _retry_broker(
+                stop_event, responsive_sleep, "get_latest_trade",
+                broker.get_latest_trade, cfg.symbol,
                 tries=2, base=0.25, cap=1.0, timeout=2.0,
                 max_total_seconds=_market_call_budget()
             )
-            if bar:
-                return float(bar.get("c", None))
+            if tr:
+                return float(tr.get("p", None))
         except Exception:
             return None
         return None
@@ -472,7 +474,7 @@ def main() -> None:
     def _enforce_tp_sl_and_maybe_exit(cfg: Config, broker: BrokerBase, journal: Journal, open_position) -> Optional[Dict[str, Any]]:
         if not open_position:
             return None
-        avg = float(getattr(open_position, "avg_price", 0.0))
+        avg = float(getattr(open_position, 'avg_price', 0.0))
         if avg <= 0:
             return open_position
         price = price_fetch()
@@ -552,7 +554,11 @@ def main() -> None:
                 bucket_now = None
 
             action = "hold"
-            display_price = float(bar_now.get("c", 0.0))
+
+            # DISPLAY price uses latest trade
+            display_price = price_fetch()
+            if display_price is None:
+                display_price = float(bar_now.get("c", 0.0))
 
             # ---------- Enforce TP/SL before strategy ----------
             if open_position:
@@ -579,7 +585,6 @@ def main() -> None:
                     prev_bar = bar_now
                 else:
                     effective_bar = prev_bar or bar_now
-                    display_price = float(effective_bar.get("c", display_price))
                     strategy.ingest(effective_bar)
                     signal_out = strategy.signal()
                     action = signal_out.get("action", "hold")
