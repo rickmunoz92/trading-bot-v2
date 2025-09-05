@@ -111,7 +111,6 @@ def parse_args() -> Config:
     )
 
 
-
 def _safe_json(obj: Any) -> str:
     try:
         return json.dumps(obj)
@@ -123,6 +122,7 @@ def _safe_json(obj: Any) -> str:
             except Exception:
                 return repr(o)
         return json.dumps(obj, default=_default)
+
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -169,6 +169,10 @@ def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, 
         kv.append(R.kv("TP", f"${_plan.take_profit:.2f} ({cfg.tp_pct:.2f}%)"))
         kv.append(R.kv("SL", f"${_plan.stop_loss:.2f} ({cfg.sl_pct:.2f}%)"))
     return "  ".join(kv)
+
+def _strategy_hit(action: Optional[str]) -> bool:
+    """Return True when the strategy signaled an actionable entry this bar."""
+    return action in ("enter_long", "enter_short")
 
 def main() -> None:
     cfg = parse_args()
@@ -237,14 +241,16 @@ def main() -> None:
             # --- Strategy ---
             strategy.ingest(bar)
             signal_out = strategy.signal()
+            action = signal_out.get("action", "hold")
 
             # --- Header (each poll with TP/SL) ---
-            print(f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=bar["c"], action=signal_out.get("action", "hold")))
+            print(f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=bar["c"], action=action))
 
             # --- Status line ---
             line = [
                 R.kv("price", f"{bar['c']:.4f}"),
-                R.kv("sig", signal_out.get("action", "hold")),
+                R.kv("sig", action),
+                R.kv("hit", "yes" if _strategy_hit(action) else "no"),
             ]
             if open_position:
                 line.append(R.kv("pos_avg", f"{open_position.avg_price:.4f}"))
@@ -252,8 +258,8 @@ def main() -> None:
             print(" ".join(line))
 
             # --- Execute ---
-            if signal_out.get("action") in ("enter_long", "enter_short") and not open_position:
-                side = "buy" if signal_out["action"] == "enter_long" else "sell"
+            if action in ("enter_long", "enter_short") and not open_position:
+                side = "buy" if action == "enter_long" else "sell"
                 entry = bar["c"]
                 tmp_plan = plan_bracket(side, entry, cfg.tp_pct, cfg.sl_pct, qty=0, meta={})
                 qty = risk_size_qty(broker.get_equity(), cfg.risk_pct, entry, tmp_plan.stop_loss, lot_size=broker.min_lot(cfg.symbol))
@@ -275,7 +281,7 @@ def main() -> None:
                         notes=json.dumps({"order_id": str(order_id)}),
                     )
 
-            elif signal_out.get("action") == "exit" and open_position:
+            elif action == "exit" and open_position:
                 exit_price = bar["c"]
                 pnl_abs, pnl_pct = broker.close_position(cfg.symbol, exit_price)
                 journal.on_exit(
@@ -299,6 +305,7 @@ def main() -> None:
             pass
         try:
             if hasattr(broker, "trading") and hasattr(broker.trading, "close"):
+            # some clients offer close(); ignore if not present
                 broker.trading.close()
         except Exception:
             pass
