@@ -14,7 +14,9 @@ except Exception:
 MT = ZoneInfo('America/Denver')
 ET = ZoneInfo('America/New_York')
 
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, Callable
+import random
+from queue import Queue, Empty
 
 from io_utils import R, Journal
 from strategies import StrategyBase, get_strategy
@@ -258,81 +260,53 @@ def _breach_for_side(side: str, price: float, tp: float, sl: float) -> Optional[
             return "sl"
     return None
 
-def _latest_close_price(broker: BrokerBase, symbol: str, timeframe: str) -> Optional[float]:
+# ---------------- New: broker call timeout + retry -------------------
+
+def _call_with_timeout(label: str, fn: Callable, args: tuple, kwargs: dict, timeout: float):
+    """
+    Run `fn(*args, **kwargs)` in a worker thread and wait `timeout` seconds.
+    If it doesn't return, raise TimeoutError so the caller can retry.
+    """
+    q: Queue = Queue(maxsize=1)
+
+    def _worker():
+        try:
+            q.put(("ok", fn(*args, **kwargs)))
+        except Exception as e:
+            q.put(("err", e))
+
+    t = threading.Thread(target=_worker, name=f"{label}-worker", daemon=True)
+    t.start()
     try:
-        bar = broker.get_latest_bar(symbol, timeframe)
-        if bar:
-            return float(bar.get("c", None))
-    except Exception:
-        pass
-    return None
+        kind, payload = q.get(timeout=timeout)
+        if kind == "ok":
+            return payload
+        else:
+            raise payload  # re-raise original exception
+    except Empty:
+        raise TimeoutError(f"{label} timed out after {timeout:.1f}s")
 
-def _reconcile_on_start(cfg: Config, broker: BrokerBase, journal: Journal) -> Optional[Dict[str, Any]]:
+def _retry_broker(stop_event: threading.Event, sleep_fn: Callable[[float], None], label: str,
+                  fn: Callable, *args, tries: int = 5, base: float = 0.5, cap: float = 5.0,
+                  timeout: float = 5.0, **kwargs):
     """
-    On startup: if we have an open position and price is already beyond TP/SL,
-    close immediately and journal the exit. Returns the (possibly updated) position.
+    Retry a broker call with jittered exponential backoff and a per-attempt timeout.
+    Prints visible warnings on each failure/timeout.
     """
-    pos = broker.get_position(cfg.symbol)
-    if not pos:
-        return None
-
-    avg = float(getattr(pos, "avg_price", 0.0))
-    if avg <= 0:
-        return pos
-
-    side = _infer_side_from_position(pos)
-    tp, sl = _compute_tp_sl_for_side(avg, side, cfg.tp_pct, cfg.sl_pct)
-    price = _latest_close_price(broker, cfg.symbol, cfg.timeframe)
-
-    if price is None:
-        return pos
-
-    hit = _breach_for_side(side, price, tp, sl)
-    if hit:
-        exit_price = price
-        pnl_abs, pnl_pct = broker.close_position(cfg.symbol, exit_price)
-        journal.on_exit(
-            when=now_utc_iso(),
-            exit_price=exit_price,
-            win_loss=("Win" if pnl_abs >= 0 else "Loss"),
-            pnl_abs=pnl_abs,
-            pnl_pct=pnl_pct,
-        )
-        return None  # now flat
-    return pos
-
-def _enforce_tp_sl_and_maybe_exit(cfg: Config, broker: BrokerBase, journal: Journal, open_position) -> Optional[Dict[str, Any]]:
-    """
-    Called each loop BEFORE strategy logic.
-    If an open position exists and TP/SL boundary is crossed, exit immediately.
-    Returns updated open_position (None if closed).
-    """
-    if not open_position:
-        return None
-
-    avg = float(getattr(open_position, "avg_price", 0.0))
-    if avg <= 0:
-        return open_position
-
-    price = _latest_close_price(broker, cfg.symbol, cfg.timeframe)
-    if price is None:
-        return open_position
-
-    side = _infer_side_from_position(open_position)
-    tp, sl = _compute_tp_sl_for_side(avg, side, cfg.tp_pct, cfg.sl_pct)
-    hit = _breach_for_side(side, price, tp, sl)
-    if hit:
-        exit_price = price
-        pnl_abs, pnl_pct = broker.close_position(cfg.symbol, exit_price)
-        journal.on_exit(
-            when=now_utc_iso(),
-            exit_price=exit_price,
-            win_loss=("Win" if pnl_abs >= 0 else "Loss"),
-            pnl_abs=pnl_abs,
-            pnl_pct=pnl_pct,
-        )
-        return None
-    return open_position
+    last_err = None
+    for attempt in range(1, tries + 1):
+        try:
+            return _call_with_timeout(label, fn, args, kwargs, timeout=timeout)
+        except Exception as e:
+            last_err = e
+            if attempt >= tries or stop_event.is_set():
+                raise
+            delay = min(cap, base * (2 ** (attempt - 1)))
+            delay *= 1.0 + 0.25 * random.random()  # jitter
+            print(R.warn(f"{label} failed: {e} — retrying in {delay:.1f}s (attempt {attempt}/{tries})"))
+            sleep_fn(delay)
+    if last_err:
+        raise last_err
 
 # --------------------------------------------------------------------
 
@@ -367,7 +341,7 @@ def main() -> None:
 
     signal.signal(signal.SIGINT, _sigint)
 
-    def responsive_sleep(total_seconds: int, step: float = 0.2):
+    def responsive_sleep(total_seconds: float, step: float = 0.2):
         """Sleep in small increments so Ctrl-C responds quickly even during long polls."""
         remaining = float(total_seconds)
         while remaining > 0 and not stop_event.is_set():
@@ -381,22 +355,112 @@ def main() -> None:
     last_bucket_sec: Optional[int] = None
     prev_bar: Optional[Dict[str, Any]] = None
 
+    # ---- Helpers that use retry+timeout ----
+    def price_fetch() -> Optional[float]:
+        try:
+            bar = _retry_broker(stop_event, responsive_sleep, "get_latest_bar",
+                                broker.get_latest_bar, cfg.symbol, cfg.timeframe, timeout=5.0)
+            if bar:
+                return float(bar.get("c", None))
+        except Exception:
+            return None
+        return None
+
+    def get_position_safe() -> Optional[Dict[str, Any]]:
+        try:
+            return _retry_broker(stop_event, responsive_sleep, "get_position",
+                                 broker.get_position, cfg.symbol, timeout=5.0)
+        except Exception as e:
+            print(R.warn(f"get_position failed: {e}"))
+            return None
+
+    def is_open_safe() -> Tuple[bool, Optional[datetime]]:
+        try:
+            return _retry_broker(stop_event, responsive_sleep, "is_trading_window_open",
+                                 broker.is_trading_window_open, cfg.symbol, allow_extended=False, timeout=5.0)
+        except TypeError:
+            state = _retry_broker(stop_event, responsive_sleep, "is_trading_window_open",
+                                  broker.is_trading_window_open, cfg.symbol, timeout=5.0)
+            if isinstance(state, tuple):
+                return state
+            return bool(state), None
+
+    # ---------- Reconciliation & enforcement (use price_fetch) ----------
+
+    def _reconcile_on_start(cfg: Config, broker: BrokerBase, journal: Journal) -> Optional[Dict[str, Any]]:
+        pos = get_position_safe()
+        if not pos:
+            return None
+        avg = float(getattr(pos, "avg_price", 0.0))
+        if avg <= 0:
+            return pos
+        side = _infer_side_from_position(pos)
+        tp = avg * (1 + cfg.tp_pct / 100.0) if side == "long" else avg * (1 - cfg.tp_pct / 100.0)
+        sl = avg * (1 - cfg.sl_pct / 100.0) if side == "long" else avg * (1 + cfg.sl_pct / 100.0)
+        price = price_fetch()
+        if price is None:
+            return pos
+        hit = _breach_for_side(side, price, tp, sl)
+        if hit:
+            exit_price = price
+            try:
+                pnl_abs, pnl_pct = _retry_broker(stop_event, responsive_sleep, "close_position",
+                                                 broker.close_position, cfg.symbol, exit_price, timeout=5.0)
+            except Exception as e:
+                print(R.warn(f"close_position failed during reconcile: {e}"))
+                return pos
+            journal.on_exit(
+                when=now_utc_iso(),
+                exit_price=exit_price,
+                win_loss=("Win" if pnl_abs >= 0 else "Loss"),
+                pnl_abs=pnl_abs,
+                pnl_pct=pnl_pct,
+            )
+            return None
+        return pos
+
+    def _enforce_tp_sl_and_maybe_exit(cfg: Config, broker: BrokerBase, journal: Journal, open_position) -> Optional[Dict[str, Any]]:
+        if not open_position:
+            return None
+        avg = float(getattr(open_position, "avg_price", 0.0))
+        if avg <= 0:
+            return open_position
+        price = price_fetch()
+        if price is None:
+            return open_position
+        side = _infer_side_from_position(open_position)
+        tp = avg * (1 + cfg.tp_pct / 100.0) if side == "long" else avg * (1 - cfg.tp_pct / 100.0)
+        sl = avg * (1 - cfg.sl_pct / 100.0) if side == "long" else avg * (1 + cfg.sl_pct / 100.0)
+        hit = _breach_for_side(side, price, tp, sl)
+        if hit:
+            exit_price = price
+            try:
+                pnl_abs, pnl_pct = _retry_broker(stop_event, responsive_sleep, "close_position",
+                                                 broker.close_position, cfg.symbol, exit_price, timeout=5.0)
+            except Exception as e:
+                print(R.warn(f"close_position failed: {e}"))
+                return open_position
+            journal.on_exit(
+                when=now_utc_iso(),
+                exit_price=exit_price,
+                win_loss=("Win" if pnl_abs >= 0 else "Loss"),
+                pnl_abs=pnl_abs,
+                pnl_pct=pnl_pct,
+            )
+            return None
+        return open_position
+
     # --- Startup: get position and reconcile immediately if TP/SL already hit ---
-    open_position = broker.get_position(cfg.symbol)
     open_position = _reconcile_on_start(cfg, broker, journal)
 
     try:
         while not stop_event.is_set():
-            # --- Trading window guard ---
+            # --- Trading window guard (with retry/timeout) ---
             try:
-                is_open, next_open_et = broker.is_trading_window_open(cfg.symbol, allow_extended=False)
-            except TypeError:
-                # Backward-compat with brokers that don't implement the 2-arg signature
-                state = broker.is_trading_window_open(cfg.symbol) if hasattr(broker, 'is_trading_window_open') else (True, None)
-                if isinstance(state, tuple):
-                    is_open, next_open_et = state
-                else:
-                    is_open, next_open_et = bool(state), None
+                is_open, next_open_et = is_open_safe()
+            except Exception as e:
+                print(R.warn(f"is_trading_window_open failed: {e} — assuming open for now"))
+                is_open, next_open_et = True, None
             if not is_open:
                 if next_open_et is not None:
                     print(f"{human_ts(now_utc_iso())} " + R.dim(f"Trading window is closed for {cfg.symbol}. It will re-open on {fmt_mt(next_open_et)}"))
@@ -405,8 +469,15 @@ def main() -> None:
                 responsive_sleep(cfg.poll)
                 continue
 
-            # --- Fetch market data (latest 1-bar snapshot from broker) ---
-            bar_now = broker.get_latest_bar(cfg.symbol, cfg.timeframe)
+            # --- Fetch market data (latest 1-bar snapshot from broker) with retry/timeout ---
+            try:
+                bar_now = _retry_broker(stop_event, responsive_sleep, "get_latest_bar",
+                                        broker.get_latest_bar, cfg.symbol, cfg.timeframe, timeout=5.0)
+            except Exception as e:
+                print(R.warn(f"get_latest_bar failed: {e}"))
+                responsive_sleep(cfg.poll)
+                continue
+
             if not bar_now:
                 print(R.warn("No market data yet."))
                 responsive_sleep(cfg.poll)
@@ -416,7 +487,7 @@ def main() -> None:
             try:
                 dt_now = _iso_to_dt(bar_now["t"])
                 sec_now = int(dt_now.timestamp())
-                bucket_now = (sec_now // tf_secs) * tf_secs
+                bucket_now = (sec_now // _parse_timeframe_seconds(cfg.timeframe)) * _parse_timeframe_seconds(cfg.timeframe)
             except Exception:
                 # If timestamp parsing fails, fall back to processing every poll as if new bar
                 bucket_now = None
@@ -424,11 +495,10 @@ def main() -> None:
             action = "hold"
             display_price = float(bar_now.get("c", 0.0))
 
-            # ---------- New: Enforce TP/SL on every loop BEFORE strategy ----------
+            # ---------- Enforce TP/SL on every loop BEFORE strategy ----------
             if open_position:
                 updated = _enforce_tp_sl_and_maybe_exit(cfg, broker, journal, open_position)
                 open_position = updated  # may become None after exit
-                # If we just exited due to TP/SL, print status and continue sleep
                 if not open_position:
                     header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=display_price, action=action)
                     line = [
@@ -439,15 +509,14 @@ def main() -> None:
                     print(f"{header} | " + " ".join(line))
                     responsive_sleep(cfg.poll)
                     continue
-            # ---------------------------------------------------------------------
+            # -----------------------------------------------------------------
 
-            # First loop: initialize tracking but DO NOT ingest yet (we need a close of the bucket).
+            # Bar gating for strategy updates
             if last_bucket_sec is None:
                 last_bucket_sec = bucket_now
                 prev_bar = bar_now
             else:
                 if bucket_now == last_bucket_sec:
-                    # Still within the same timeframe bucket => update prev_bar and skip strategy updates.
                     prev_bar = bar_now
                 else:
                     # We have moved into a NEW bucket: process the PREVIOUS bar snapshot as the completed bar.
@@ -484,18 +553,34 @@ def main() -> None:
                     pass
             print(f"{header} | " + " ".join(line))
 
-            # --- Execute ---
+            # --- Execute (with retry/timeout) ---
             if action in ("enter_long", "enter_short") and not open_position:
                 side = "buy" if action == "enter_long" else "sell"
                 entry = display_price
                 tmp_plan = plan_bracket(side, entry, cfg.tp_pct, cfg.sl_pct, qty=0, meta={})
-                qty = risk_size_qty(broker.get_equity(), cfg.risk_pct, entry, tmp_plan.stop_loss, lot_size=broker.min_lot(cfg.symbol))
+                try:
+                    equity = _retry_broker(stop_event, responsive_sleep, "get_equity", broker.get_equity, timeout=5.0)
+                    lot = _retry_broker(stop_event, responsive_sleep, "min_lot", broker.min_lot, cfg.symbol, timeout=5.0)
+                except Exception as e:
+                    print(R.warn(f"pre-entry sizing failed: {e}"))
+                    responsive_sleep(cfg.poll)
+                    continue
+
+                qty = risk_size_qty(equity, cfg.risk_pct, entry, tmp_plan.stop_loss, lot_size=lot)
                 if qty <= 0:
                     print(R.warn("qty computed to 0; skipping."))
                 else:
                     plan = plan_bracket(side, entry, cfg.tp_pct, cfg.sl_pct, qty=qty, meta={"strategy": cfg.strategy_name})
-                    order_id = broker.submit_bracket(cfg.symbol, plan)
-                    open_position = broker.get_position(cfg.symbol)
+                    try:
+                        order_id = _retry_broker(stop_event, responsive_sleep, "submit_bracket",
+                                                 broker.submit_bracket, cfg.symbol, plan, timeout=5.0)
+                        open_position = get_position_safe()
+                    except Exception as e:
+                        print(R.warn(f"submit_bracket failed: {e}"))
+                        open_position = None
+                        responsive_sleep(cfg.poll)
+                        continue
+
                     journal.on_entry(
                         when=now_utc_iso(),
                         symbol=cfg.symbol,
@@ -510,7 +595,13 @@ def main() -> None:
 
             elif action == "exit" and open_position:
                 exit_price = display_price
-                pnl_abs, pnl_pct = broker.close_position(cfg.symbol, exit_price)
+                try:
+                    pnl_abs, pnl_pct = _retry_broker(stop_event, responsive_sleep, "close_position",
+                                                     broker.close_position, cfg.symbol, exit_price, timeout=5.0)
+                except Exception as e:
+                    print(R.warn(f"close_position failed: {e}"))
+                    responsive_sleep(cfg.poll)
+                    continue
                 journal.on_exit(
                     when=now_utc_iso(),
                     exit_price=exit_price,
