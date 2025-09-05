@@ -14,7 +14,7 @@ except Exception:
 MT = ZoneInfo('America/Denver')
 ET = ZoneInfo('America/New_York')
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 from io_utils import R, Journal
 from strategies import StrategyBase, get_strategy
@@ -211,6 +211,131 @@ def _parse_timeframe_seconds(tf: str) -> int:
 def _iso_to_dt(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
+# ---------- New: TP/SL reconciliation & enforcement helpers ----------
+
+def _infer_side_from_position(pos) -> str:
+    """
+    Returns 'long' or 'short' based on position.
+    Tries pos.side if present; else infers from qty.
+    """
+    try:
+        s = getattr(pos, "side", None)
+        if s in ("long", "short"):
+            return s
+    except Exception:
+        pass
+    try:
+        qty = float(getattr(pos, "qty", 0.0))
+        return "long" if qty >= 0 else "short"
+    except Exception:
+        return "long"
+
+def _compute_tp_sl_for_side(avg_price: float, side: str, tp_pct: float, sl_pct: float) -> Tuple[float, float]:
+    """
+    Returns (tp_price, sl_price) for given side.
+    """
+    if side == "long":
+        tp = avg_price * (1 + tp_pct / 100.0)
+        sl = avg_price * (1 - sl_pct / 100.0)
+    else:
+        tp = avg_price * (1 - tp_pct / 100.0)
+        sl = avg_price * (1 + sl_pct / 100.0)
+    return (tp, sl)
+
+def _breach_for_side(side: str, price: float, tp: float, sl: float) -> Optional[str]:
+    """
+    Returns 'tp' if TP is hit, 'sl' if SL is hit, else None.
+    """
+    if side == "long":
+        if price >= tp:
+            return "tp"
+        if price <= sl:
+            return "sl"
+    else:  # short
+        if price <= tp:
+            return "tp"
+        if price >= sl:
+            return "sl"
+    return None
+
+def _latest_close_price(broker: BrokerBase, symbol: str, timeframe: str) -> Optional[float]:
+    try:
+        bar = broker.get_latest_bar(symbol, timeframe)
+        if bar:
+            return float(bar.get("c", None))
+    except Exception:
+        pass
+    return None
+
+def _reconcile_on_start(cfg: Config, broker: BrokerBase, journal: Journal) -> Optional[Dict[str, Any]]:
+    """
+    On startup: if we have an open position and price is already beyond TP/SL,
+    close immediately and journal the exit. Returns the (possibly updated) position.
+    """
+    pos = broker.get_position(cfg.symbol)
+    if not pos:
+        return None
+
+    avg = float(getattr(pos, "avg_price", 0.0))
+    if avg <= 0:
+        return pos
+
+    side = _infer_side_from_position(pos)
+    tp, sl = _compute_tp_sl_for_side(avg, side, cfg.tp_pct, cfg.sl_pct)
+    price = _latest_close_price(broker, cfg.symbol, cfg.timeframe)
+
+    if price is None:
+        return pos
+
+    hit = _breach_for_side(side, price, tp, sl)
+    if hit:
+        exit_price = price
+        pnl_abs, pnl_pct = broker.close_position(cfg.symbol, exit_price)
+        journal.on_exit(
+            when=now_utc_iso(),
+            exit_price=exit_price,
+            win_loss=("Win" if pnl_abs >= 0 else "Loss"),
+            pnl_abs=pnl_abs,
+            pnl_pct=pnl_pct,
+        )
+        return None  # now flat
+    return pos
+
+def _enforce_tp_sl_and_maybe_exit(cfg: Config, broker: BrokerBase, journal: Journal, open_position) -> Optional[Dict[str, Any]]:
+    """
+    Called each loop BEFORE strategy logic.
+    If an open position exists and TP/SL boundary is crossed, exit immediately.
+    Returns updated open_position (None if closed).
+    """
+    if not open_position:
+        return None
+
+    avg = float(getattr(open_position, "avg_price", 0.0))
+    if avg <= 0:
+        return open_position
+
+    price = _latest_close_price(broker, cfg.symbol, cfg.timeframe)
+    if price is None:
+        return open_position
+
+    side = _infer_side_from_position(open_position)
+    tp, sl = _compute_tp_sl_for_side(avg, side, cfg.tp_pct, cfg.sl_pct)
+    hit = _breach_for_side(side, price, tp, sl)
+    if hit:
+        exit_price = price
+        pnl_abs, pnl_pct = broker.close_position(cfg.symbol, exit_price)
+        journal.on_exit(
+            when=now_utc_iso(),
+            exit_price=exit_price,
+            win_loss=("Win" if pnl_abs >= 0 else "Loss"),
+            pnl_abs=pnl_abs,
+            pnl_pct=pnl_pct,
+        )
+        return None
+    return open_position
+
+# --------------------------------------------------------------------
+
 def main() -> None:
     cfg = parse_args()
 
@@ -255,7 +380,10 @@ def main() -> None:
     tf_secs = _parse_timeframe_seconds(cfg.timeframe)
     last_bucket_sec: Optional[int] = None
     prev_bar: Optional[Dict[str, Any]] = None
+
+    # --- Startup: get position and reconcile immediately if TP/SL already hit ---
     open_position = broker.get_position(cfg.symbol)
+    open_position = _reconcile_on_start(cfg, broker, journal)
 
     try:
         while not stop_event.is_set():
@@ -296,6 +424,23 @@ def main() -> None:
             action = "hold"
             display_price = float(bar_now.get("c", 0.0))
 
+            # ---------- New: Enforce TP/SL on every loop BEFORE strategy ----------
+            if open_position:
+                updated = _enforce_tp_sl_and_maybe_exit(cfg, broker, journal, open_position)
+                open_position = updated  # may become None after exit
+                # If we just exited due to TP/SL, print status and continue sleep
+                if not open_position:
+                    header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=display_price, action=action)
+                    line = [
+                        R.kv("price", f"{display_price:.4f}"),
+                        R.kv("sig", "exit (tp/sl)"),
+                        R.kv("hit", "n/a"),
+                    ]
+                    print(f"{header} | " + " ".join(line))
+                    responsive_sleep(cfg.poll)
+                    continue
+            # ---------------------------------------------------------------------
+
             # First loop: initialize tracking but DO NOT ingest yet (we need a close of the bucket).
             if last_bucket_sec is None:
                 last_bucket_sec = bucket_now
@@ -332,8 +477,11 @@ def main() -> None:
                 R.kv("hit", "yes" if _strategy_hit(action) else "no"),
             ]
             if open_position:
-                line.append(R.kv("pos_avg", f"{open_position.avg_price:.4f}"))
-                line.append(R.kv("pos_qty", f"{open_position.qty}"))
+                try:
+                    line.append(R.kv("pos_avg", f"{float(getattr(open_position, 'avg_price', 0.0)):.4f}"))
+                    line.append(R.kv("pos_qty", f"{getattr(open_position, 'qty', 0)}"))
+                except Exception:
+                    pass
             print(f"{header} | " + " ".join(line))
 
             # --- Execute ---
