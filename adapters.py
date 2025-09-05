@@ -1,9 +1,9 @@
-
 import os
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime, timezone, time, timedelta
 import random
+import time as _time
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -299,6 +299,59 @@ class AlpacaBroker(BrokerBase):
         bars.sort(key=lambda x: x["t"])
         return bars
 
+    def _cancel_open_orders_for_symbol(self, sym_norm: str, timeout_sec: float = 5.0) -> None:
+        """
+        Cancel any open orders for the given normalized trading symbol (e.g., 'AAPL' or 'BTCUSD').
+        We try multiple client methods to stay compatible across alpaca-py versions.
+        """
+        # Gather open orders for the symbol
+        orders: List[Any] = []
+        try:
+            # Preferred: filter by status & symbol(s)
+            from alpaca.trading.requests import GetOrdersRequest
+            req = GetOrdersRequest(status='open', nested=False, symbols=[sym_norm])
+            orders = list(self.trading.get_orders(filter=req) or [])
+        except Exception:
+            try:
+                # Fallback #1: status arg
+                orders = list(self.trading.get_orders(status='open') or [])
+            except Exception:
+                # Fallback #2: no args
+                orders = list(self.trading.get_orders() or [])
+        # Filter by symbol just in case
+        orders = [o for o in orders if getattr(o, "symbol", "") == sym_norm]
+
+        # Cancel each order; try cancel_order_by_id first
+        for o in orders:
+            oid = getattr(o, "id", None) or getattr(o, "client_order_id", None)
+            if not oid:
+                continue
+            try:
+                self.trading.cancel_order_by_id(oid)
+            except Exception:
+                try:
+                    self.trading.cancel_order(oid)
+                except Exception:
+                    pass  # ignore
+
+        # Wait until no open orders remain for the symbol (or timeout)
+        end = _time.time() + max(0.0, timeout_sec)
+        while _time.time() < end:
+            try:
+                refreshed: List[Any] = []
+                try:
+                    from alpaca.trading.requests import GetOrdersRequest
+                    req = GetOrdersRequest(status='open', nested=False, symbols=[sym_norm])
+                    refreshed = list(self.trading.get_orders(filter=req) or [])
+                except Exception:
+                    refreshed = list(self.trading.get_orders(status='open') or [])
+            except Exception:
+                refreshed = []
+            refreshed = [o for o in refreshed if getattr(o, "symbol", "") == sym_norm]
+            if not refreshed:
+                break
+            _time.sleep(0.2)
+
     def submit_bracket(self, symbol: str, plan) -> str:
         from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
         from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
@@ -332,16 +385,80 @@ class AlpacaBroker(BrokerBase):
             return res.id
 
     def close_position(self, symbol: str, exit_price: float):
+        """
+        Safely flatten a position even if bracket child orders (TP/SL) are holding qty.
+        Strategy:
+          1) Cancel any open orders for the symbol (TP/SL legs).
+          2) Wait briefly until they are gone.
+          3) Call close_position on the trading client.
+        Returns (pnl_abs, pnl_pct) computed from avg_entry_price and provided exit_price.
+        """
         # TRADING API uses 'BASEQUOTE' for crypto
         sym = _to_alpaca_crypto_trading_symbol(symbol) if _is_crypto_symbol(symbol) else _normalize_symbol(symbol)
         try:
             pos = self.trading.get_open_position(sym)
         except Exception:
             return 0.0, 0.0
+
+        # Cancel any open orders (e.g., bracket OCO legs) to free held qty
+        try:
+            self._cancel_open_orders_for_symbol(sym_norm=sym, timeout_sec=5.0)
+        except Exception:
+            pass  # best-effort; proceed either way
+
+        # Re-fetch to compute PnL & ensure we still have a position
+        try:
+            pos = self.trading.get_open_position(sym)
+        except Exception:
+            return 0.0, 0.0
+
         avg = float(pos.avg_entry_price)
-        qty = float(getattr(pos, "qty", getattr(pos, "current_qty", 0)))
+        # qty is needed for PnL calc; API may name it qty or current_qty
+        try:
+            qty = float(getattr(pos, "qty", getattr(pos, "current_qty", 0)))
+        except Exception:
+            qty = float(getattr(pos, "qty", 0))
+
         side = 1 if qty > 0 else -1
-        self.trading.close_position(sym)
+
+        # Attempt to close; some client versions support cancel_orders flag
+        try:
+            try:
+                self.trading.close_position(sym, cancel_orders=True)  # type: ignore[arg-type]
+            except Exception:
+                self.trading.close_position(sym)
+        except Exception as e:
+            # As a last resort, submit a market order to flatten (prefer reduce-only when supported)
+            try:
+                from alpaca.trading.requests import MarketOrderRequest
+                from alpaca.trading.enums import OrderSide, TimeInForce
+                s = OrderSide.SELL if qty > 0 else OrderSide.BUY
+
+                # Try with reduce_only first (some alpaca-py versions support it)
+                try:
+                    order = MarketOrderRequest(
+                        symbol=sym,
+                        qty=abs(qty),
+                        side=s,
+                        time_in_force=TimeInForce.GTC,
+                        client_order_id=f"close-reduce-{sym}-{int(datetime.now().timestamp())}",
+                        reduce_only=True  # type: ignore[arg-type]
+                    )
+                except Exception:
+                    # Fallback without reduce_only
+                    order = MarketOrderRequest(
+                        symbol=sym,
+                        qty=abs(qty),
+                        side=s,
+                        time_in_force=TimeInForce.GTC,
+                        client_order_id=f"close-{sym}-{int(datetime.now().timestamp())}"
+                    )
+
+                self.trading.submit_order(order_data=order)
+            except Exception:
+                # If even that fails, re-raise the original error so caller can log it
+                raise e
+
         pnl_abs = side * (exit_price - avg) * abs(qty)
         pnl_pct = (exit_price - avg) / avg * side * 100.0
         return pnl_abs, pnl_pct
