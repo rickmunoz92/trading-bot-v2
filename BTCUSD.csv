@@ -1,1 +1,3 @@
 Entry Date,Entry Time,Exit Date,Exit Time,Symbol,Asset Class,Strategy/Setup,Entry Price,Stop Loss,Take Profit,Exit Price,Position Size,Result (Win/Loss),PnL ($),PnL (%),Notes
+"Thu Sep 04, 2025",09:17:42 PM,"Thu Sep 04, 2025",09:18:43 PM,BTCUSD,crypto,EMA Cross (9/21),111238.9500,110126.5605,113463.7290,111225.5095,0.898,Loss,-71.35,-0.07,"{""order_id"": ""2e8af98e-c87c-4e55-81b1-32ff3927ef36""}"
+"Thu Sep 04, 2025",09:20:46 PM,"Thu Sep 04, 2025",09:25:52 PM,BTCUSD,crypto,EMA Cross (9/21),111280.2445,110167.4421,113505.8494,111158.7125,0.8971,Win,0.00,0.00,"{""order_id"": ""182251ae-6d7f-461c-ac8c-9f2502e6dced""}"
