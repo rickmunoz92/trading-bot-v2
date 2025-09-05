@@ -267,7 +267,7 @@ def main() -> None:
             action = _apply_side_filter(action, cfg.side)
 
             # --- Header (each poll with TP/SL) ---
-            print(f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=bar["c"], action=action))
+            header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=bar["c"], action=action)
 
             # --- Status line ---
             line = [
@@ -278,7 +278,7 @@ def main() -> None:
             if open_position:
                 line.append(R.kv("pos_avg", f"{open_position.avg_price:.4f}"))
                 line.append(R.kv("pos_qty", f"{open_position.qty}"))
-            print(" ".join(line))
+            print(f"{header} | " + " ".join(line))
 
             # --- Execute ---
             if action in ("enter_long", "enter_short") and not open_position:
