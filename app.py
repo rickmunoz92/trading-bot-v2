@@ -1,6 +1,5 @@
 
 import re
-
 import argparse
 import json
 import signal
@@ -12,6 +11,7 @@ try:
     from zoneinfo import ZoneInfo
 except Exception:
     from backports.zoneinfo import ZoneInfo  # type: ignore
+
 MT = ZoneInfo('America/Denver')
 ET = ZoneInfo('America/New_York')
 
@@ -22,6 +22,9 @@ from queue import Queue, Empty
 from io_utils import R, Journal
 from strategies import StrategyBase, get_strategy
 from adapters import BrokerBase, LocalPaperBroker, make_broker
+
+
+# ------------------------------- Data classes -------------------------------
 
 @dataclass
 class Config:
@@ -49,20 +52,18 @@ class OrderPlan:
     meta: Dict[str, Any]
 
 
+# ------------------------------ Format helpers -----------------------------
+
 def format_strategy_label(name: str, fast: int, slow: int, state: Optional[Dict[str, Any]] = None) -> str:
     """
-    Render a human-friendly strategy label. If a debug `state` is provided and it
-    contains EMA values, include them inline like:
-        'EMA Cross (9=112770.5455 / 21=112688.6210)'
-    Otherwise, show just the periods:
-        'EMA Cross (9/21)'
+    If debug `state` contains EMA values, include them:
+      'EMA Cross (9=112770.5455 / 21=112688.6210)'
+    Otherwise:
+      'EMA Cross (9/21)'
     """
-    names = {
-        "ema_cross": "EMA Cross",
-    }
+    names = {"ema_cross": "EMA Cross"}
     label = names.get(name, name.replace("_", " ").title())
     if state:
-        # Prefer keys 'ema_fast' and 'ema_slow' when present
         ef = state.get("ema_fast")
         es = state.get("ema_slow")
         def _fmt(v):
@@ -77,7 +78,7 @@ def format_strategy_label(name: str, fast: int, slow: int, state: Optional[Dict[
 def human_ts(ts: str) -> str:
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        dt = dt.astimezone()  # convert UTC to local timezone
+        dt = dt.astimezone()
         return dt.strftime("%I:%M:%S %p %a %b %d, %Y")
     except Exception:
         return ts
@@ -88,6 +89,9 @@ def fmt_mt(dt: datetime) -> str:
     s = re.sub(r"@ 0(\d):", r"@ \1:", s)
     return f"{s} MT"
 
+
+# --------------------------------- CLI -------------------------------------
+
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Lightweight trading bot")
     p.add_argument("timeframe", type=str, help="e.g. 5m, 15m, 1h, 1d")
@@ -97,14 +101,15 @@ def parse_args() -> Config:
     p.add_argument("sl_pct", type=float, help="stop loss %")
 
     p.add_argument("--poll", type=int, default=60, help="polling interval seconds")
-    p.add_argument("--strategy", nargs="+", default=["ema_cross"], help="strategy and optional params, e.g.: --strategy ema_cross 9 21")
+    p.add_argument("--strategy", nargs="+", default=["ema_cross"],
+                   help="strategy and optional params, e.g.: --strategy ema_cross 9 21")
     p.add_argument("--trade-mode", choices=["paper", "live"], default="paper")
     p.add_argument("--broker", choices=["alpaca", "ibkr", "local"], default="local")
     p.add_argument("--equity", type=float, default=100_000.0, help="only for local paper broker")
     p.add_argument("--fast", type=int, default=9, help="ema fast period")
     p.add_argument("--slow", type=int, default=21, help="ema slow period")
     p.add_argument("--side", choices=["long", "short", "both"], default=None,
-                   help="Restrict trades to long only, short only, or both. Default: equities=both, crypto=long.")
+                   help="Restrict trades: long only, short only, or both. Default: equities=both, crypto=long.")
 
     a = p.parse_args()
     if isinstance(a.strategy, list):
@@ -133,6 +138,8 @@ def parse_args() -> Config:
     )
 
 
+# ---------------------------- Generic utilities ----------------------------
+
 def _safe_json(obj: Any) -> str:
     try:
         return json.dumps(obj)
@@ -150,15 +157,14 @@ def now_utc_iso() -> str:
 def plan_bracket(side: str, entry: float, tp_pct: float, sl_pct: float, qty: float, meta: Dict[str, Any]) -> OrderPlan:
     if side not in ("buy", "sell"):
         raise ValueError("side must be 'buy' or 'sell'")
-
     if side == "buy":
         take = entry * (1 + tp_pct / 100.0)
         stop = entry * (1 - sl_pct / 100.0)
     else:
         take = entry * (1 - tp_pct / 100.0)
         stop = entry * (1 + sl_pct / 100.0)
-
-    return OrderPlan(side=side, qty=qty, entry=entry, take_profit=round(take, 4), stop_loss=round(stop, 4), meta=meta)
+    return OrderPlan(side=side, qty=qty, entry=entry,
+                     take_profit=round(take, 4), stop_loss=round(stop, 4), meta=meta)
 
 def risk_size_qty(equity: float, risk_pct: float, entry: float, stop: float, lot_size: float = 1.0) -> float:
     risk_dollars = equity * (risk_pct / 100.0)
@@ -168,27 +174,6 @@ def risk_size_qty(equity: float, risk_pct: float, entry: float, stop: float, lot
     qty = risk_dollars / per_unit_risk
     steps = int(qty / lot_size)
     return max(0.0, steps * lot_size)
-
-def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, action: str = None, strategy_state: Optional[Dict[str, Any]] = None) -> str:
-    kv = [
-        R.kv("timeframe", cfg.timeframe),
-        R.kv("symbol", cfg.symbol),
-        R.kv("mode", cfg.trade_mode.upper()),
-        R.kv("broker", broker.name.upper()),
-        R.kv("strategy", format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow, strategy_state)),
-        R.kv("side", (cfg.side or "").upper() or "AUTO"),
-        R.kv("Risk", f"${cfg.equity * (cfg.risk_pct/100.0):.2f} ({cfg.risk_pct:.2f}%)"),
-        R.kv("poll", f"{cfg.poll}s"),
-    ]
-    if current_price is not None:
-        if action in ("enter_long", "enter_short"):
-            _side = "buy" if action == "enter_long" else "sell"
-        else:
-            _side = "buy"
-        _plan = plan_bracket(_side, current_price, cfg.tp_pct, cfg.sl_pct, qty=0, meta={})
-        kv.append(R.kv("TP", f"${_plan.take_profit:.2f} ({cfg.tp_pct:.2f}%)"))
-        kv.append(R.kv("SL", f"${_plan.stop_loss:.2f} ({cfg.sl_pct:.2f}%)"))
-    return "  ".join(kv)
 
 def _strategy_hit(action: Optional[str]) -> bool:
     return action in ("enter_long", "enter_short")
@@ -218,6 +203,7 @@ def _parse_timeframe_seconds(tf: str) -> int:
 
 def _iso_to_dt(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
 
 # ---------- TP/SL reconciliation & enforcement helpers ----------
 
@@ -255,6 +241,7 @@ def _breach_for_side(side: str, price: float, tp: float, sl: float) -> Optional[
         if price >= sl:
             return "sl"
     return None
+
 
 # ---------------- Broker call timeout + retry (with budget) -------------------
 
@@ -306,10 +293,8 @@ def _retry_broker(
             last_err = e
             if attempt >= tries:
                 break
-            # honor budget before sleeping
             delay = min(cap, base * (2 ** (attempt - 1)))
             delay *= 1.0 + 0.25 * random.random()  # jitter
-            # If the remaining budget is smaller than delay, trim it
             if max_total_seconds is not None:
                 remaining = max_total_seconds - (time.monotonic() - start)
                 if remaining <= 0:
@@ -320,7 +305,8 @@ def _retry_broker(
     if last_err:
         raise last_err
 
-# --------------------------------------------------------------------
+
+# --------------------------------- Main -------------------------------------
 
 def main() -> None:
     cfg = parse_args()
@@ -366,12 +352,12 @@ def main() -> None:
     last_bucket_sec: Optional[int] = None
     prev_bar: Optional[Dict[str, Any]] = None
 
-    # Quick/budgeted fetch helpers
+    # --------- Market call budget helper ---------
     def _market_call_budget() -> float:
         # Use up to 60% of poll interval for live data calls (never < 2s, never > 6s)
         return max(2.0, min(6.0, cfg.poll * 0.6))
 
-    # DISPLAY price: use latest TRADE (matches Alpaca UI). Signals still use CLOSED bars.
+    # DISPLAY price: latest trade (matches Alpaca UI). Signals still use CLOSED bars.
     def price_fetch() -> Optional[float]:
         try:
             tr = _retry_broker(
@@ -425,16 +411,14 @@ def main() -> None:
             broker.get_recent_bars, cfg.symbol, cfg.timeframe, hist_limit,
             tries=2, base=0.25, cap=1.0, timeout=3.0, max_total_seconds=_market_call_budget()
         ) or []
-        # Feed historical CLOSED bars (oldest→newest) into the strategy
         for b in bars:
-            strategy.ingest(b)
-        # Prime prev_rel without emitting a signal line
-        _ = strategy.signal()
+            strategy.ingest(b)  # CLOSED bars oldest→newest
+        _ = strategy.signal()  # prime without header print
     except Exception as e:
         print(R.warn(f"Historical backfill unavailable: {e}"))
     # -----------------------------------------------------
 
-    # ---------- Reconciliation & enforcement (use price_fetch) ----------
+    # ---------- Reconciliation & enforcement ----------
     def _reconcile_on_start(cfg: Config, broker: BrokerBase, journal: Journal) -> Optional[Dict[str, Any]]:
         pos = get_position_safe()
         if not pos:
@@ -549,7 +533,8 @@ def main() -> None:
             try:
                 dt_now = _iso_to_dt(bar_now["t"])
                 sec_now = int(dt_now.timestamp())
-                bucket_now = (sec_now // _parse_timeframe_seconds(cfg.timeframe)) * _parse_timeframe_seconds(cfg.timeframe)
+                tf_size = _parse_timeframe_seconds(cfg.timeframe)
+                bucket_now = (sec_now // tf_size) * tf_size
             except Exception:
                 bucket_now = None
 
@@ -560,18 +545,44 @@ def main() -> None:
             if display_price is None:
                 display_price = float(bar_now.get("c", 0.0))
 
+            # --- Re-sync broker position each loop (detect manual closes/opens) ---
+            try:
+                pos_now = get_position_safe()
+                def _f(v, d=0.0):
+                    try:
+                        return float(v)
+                    except Exception:
+                        return d
+                if pos_now is None:
+                    if open_position is not None:
+                        print(R.dim(f"Reconciled: broker shows flat for {cfg.symbol}; clearing local position cache."))
+                    open_position = None
+                else:
+                    if (
+                        (open_position is None) or
+                        (_f(getattr(open_position, "qty", 0)) != _f(getattr(pos_now, "qty", 0))) or
+                        (_f(getattr(open_position, "avg_price", 0)) != _f(getattr(pos_now, "avg_price", 0)))
+                    ):
+                        open_position = pos_now
+            except Exception as e:
+                print(R.warn(f"position re-sync failed: {e}"))
+            # ------------------------------------------------------------------------------
+
             # ---------- Enforce TP/SL before strategy ----------
             if open_position:
                 updated = _enforce_tp_sl_and_maybe_exit(cfg, broker, journal, open_position)
                 open_position = updated
                 if not open_position:
-                    header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=display_price, action=action, strategy_state=getattr(strategy, "debug_state", lambda: {})())
+                    header_line = f"{human_ts(now_utc_iso())} " + format_header(
+                        cfg, broker, current_price=display_price, action=action,
+                        strategy_state=getattr(strategy, "debug_state", lambda: {})()
+                    )
                     line = [
                         R.kv("price", f"{display_price:.4f}"),
                         R.kv("sig", "exit (tp/sl)"),
                         R.kv("hit", "n/a"),
                     ]
-                    print(f"{header} | " + " ".join(line))
+                    print(f"{header_line} | " + " ".join(line))
                     pace_sleep(loop_start, cfg.poll)
                     continue
             # -----------------------------------------------------------------
@@ -584,7 +595,7 @@ def main() -> None:
                 if bucket_now == last_bucket_sec:
                     prev_bar = bar_now
                 else:
-                    effective_bar = prev_bar or bar_now
+                    effective_bar = prev_bar or bar_now  # use last CLOSED bar
                     strategy.ingest(effective_bar)
                     signal_out = strategy.signal()
                     action = signal_out.get("action", "hold")
@@ -593,8 +604,9 @@ def main() -> None:
                     prev_bar = bar_now
 
             # --- Header (includes EMA values when available) ---
-            header = f"{human_ts(now_utc_iso())} " + format_header(
-                cfg, broker, current_price=display_price, action=action, strategy_state=getattr(strategy, "debug_state", lambda: {})()
+            header_line = f"{human_ts(now_utc_iso())} " + format_header(
+                cfg, broker, current_price=display_price, action=action,
+                strategy_state=getattr(strategy, "debug_state", lambda: {})()
             )
 
             # --- Status line ---
@@ -609,7 +621,7 @@ def main() -> None:
                     line.append(R.kv("pos_qty", f"{getattr(open_position, 'qty', 0)}"))
                 except Exception:
                     pass
-            print(f"{header} | " + " ".join(line))
+            print(f"{header_line} | " + " ".join(line))
 
             # --- Execute (budgeted retry) ---
             if action in ("enter_long", "enter_short") and not open_position:
@@ -618,89 +630,83 @@ def main() -> None:
                 tmp_plan = plan_bracket(side, entry, cfg.tp_pct, cfg.sl_pct, qty=0, meta={})
                 try:
                     equity = _retry_broker(
-                        stop_event, responsive_sleep, "get_equity", broker.get_equity,
-                        tries=2, base=0.25, cap=1.0, timeout=2.0,
-                        max_total_seconds=_market_call_budget()
-                    )
-                    lot = _retry_broker(
-                        stop_event, responsive_sleep, "min_lot", broker.min_lot, cfg.symbol,
+                        stop_event, responsive_sleep, "get_equity",
+                        broker.get_equity,
                         tries=2, base=0.25, cap=1.0, timeout=2.0,
                         max_total_seconds=_market_call_budget()
                     )
                 except Exception as e:
-                    print(R.warn(f"pre-entry sizing failed: {e}"))
+                    print(R.warn(f"get_equity failed: {e}"))
                     pace_sleep(loop_start, cfg.poll)
                     continue
 
-                qty = risk_size_qty(equity, cfg.risk_pct, entry, tmp_plan.stop_loss, lot_size=lot)
+                # Risk-based sizing
+                lot = broker.min_lot(cfg.symbol)
+                qty = risk_size_qty(equity=equity, risk_pct=cfg.risk_pct,
+                                    entry=tmp_plan.entry, stop=tmp_plan.stop_loss, lot_size=lot)
                 if qty <= 0:
-                    print(R.warn("qty computed to 0; skipping."))
-                else:
-                    plan = plan_bracket(side, entry, cfg.tp_pct, cfg.sl_pct, qty=qty, meta={"strategy": cfg.strategy_name})
-                    try:
-                        order_id = _retry_broker(
-                            stop_event, responsive_sleep, "submit_bracket",
-                            broker.submit_bracket, cfg.symbol, plan,
-                            tries=2, base=0.25, cap=1.0, timeout=2.0,
-                            max_total_seconds=_market_call_budget()
-                        )
-                        open_position = get_position_safe()
-                    except Exception as e:
-                        print(R.warn(f"submit_bracket failed: {e}"))
-                        open_position = None
-                        pace_sleep(loop_start, cfg.poll)
-                        continue
+                    print(R.warn(f"qty computed as 0 (lot={lot}); skipping entry"))
+                    pace_sleep(loop_start, cfg.poll)
+                    continue
 
-                    journal.on_entry(
-                        when=now_utc_iso(),
-                        symbol=cfg.symbol,
-                        asset_class=broker.asset_class(cfg.symbol),
-                        strategy=format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow, getattr(strategy, "debug_state", lambda: {})()),
-                        entry_price=plan.entry,
-                        stop_loss=plan.stop_loss,
-                        take_profit=plan.take_profit,
-                        position_size=qty,
-                        notes=json.dumps({"order_id": str(order_id)}),
-                    )
+                plan = OrderPlan(side=side, qty=qty, entry=entry,
+                                 take_profit=tmp_plan.take_profit, stop_loss=tmp_plan.stop_loss, meta={})
 
-            elif action == "exit" and open_position:
-                exit_price = display_price
                 try:
-                    pnl_abs, pnl_pct = _retry_broker(
-                        stop_event, responsive_sleep, "close_position",
-                        broker.close_position, cfg.symbol, exit_price,
-                        tries=2, base=0.25, cap=1.0, timeout=2.0,
+                    order_id = _retry_broker(
+                        stop_event, responsive_sleep, "submit_bracket",
+                        broker.submit_bracket, cfg.symbol, plan,
+                        tries=2, base=0.25, cap=1.0, timeout=3.0,
                         max_total_seconds=_market_call_budget()
                     )
                 except Exception as e:
-                    print(R.warn(f"close_position failed: {e}"))
+                    print(R.warn(f"submit_bracket failed: {e}"))
                     pace_sleep(loop_start, cfg.poll)
                     continue
-                journal.on_exit(
-                    when=now_utc_iso(),
-                    exit_price=exit_price,
-                    win_loss=("Win" if pnl_abs >= 0 else "Loss"),
-                    pnl_abs=pnl_abs,
-                    pnl_pct=pnl_pct,
-                )
-                open_position = None
 
+                journal.on_entry(
+                    when=now_utc_iso(),
+                    entry_price=entry,
+                    qty=qty,
+                    tp=plan.take_profit,
+                    sl=plan.stop_loss,
+                    meta={"order_id": order_id, "strategy": cfg.strategy_name}
+                )
+                # refresh cached position after submit
+                open_position = get_position_safe()
+
+                print(f"{human_ts(now_utc_iso())} " + R.good(f"entered {side.upper()} {cfg.symbol} @ {entry:.4f} qty={qty} tp={plan.take_profit:.4f} sl={plan.stop_loss:.4f} (order_id={order_id})"))
+
+            # --- Pace loop ---
             pace_sleep(loop_start, cfg.poll)
 
-    except KeyboardInterrupt:
-        stop_event.set()
     finally:
-        try:
-            if hasattr(broker, "ib"):
-                broker.ib.disconnect()
-        except Exception:
-            pass
-        try:
-            if hasattr(broker, "trading") and hasattr(broker.trading, "close"):
-                broker.trading.close()
-        except Exception:
-            pass
-        print("\n" + R.dim("Stopped."))
+        print(R.dim("Stopped."))
+        # nothing else to clean up
+
+
+# ---- header builder (no timestamp inside strategy) ----
+def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, action: str = None, strategy_state: Optional[Dict[str, Any]] = None) -> str:
+    kv = [
+        R.kv("timeframe", cfg.timeframe),
+        R.kv("symbol", cfg.symbol),
+        R.kv("mode", cfg.trade_mode.upper()),
+        R.kv("broker", broker.name.upper()),
+        R.kv("strategy", format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow, strategy_state)),
+        R.kv("side", (cfg.side or '').upper() or 'AUTO'),
+        R.kv("Risk", f"${cfg.equity * (cfg.risk_pct/100.0):.2f} ({cfg.risk_pct:.2f}%)"),
+        R.kv("poll", f"{cfg.poll}s"),
+    ]
+    if current_price is not None:
+        if action in ("enter_long", "enter_short"):
+            _side = "buy" if action == "enter_long" else "sell"
+        else:
+            _side = "buy"
+        _plan = plan_bracket(_side, current_price, cfg.tp_pct, cfg.sl_pct, qty=0, meta={})
+        kv.append(R.kv("TP", f"${_plan.take_profit:.2f} ({cfg.tp_pct:.2f}%)"))
+        kv.append(R.kv("SL", f"${_plan.stop_loss:.2f} ({cfg.sl_pct:.2f}%)"))
+    return "  ".join(kv)
+
 
 if __name__ == "__main__":
     main()
