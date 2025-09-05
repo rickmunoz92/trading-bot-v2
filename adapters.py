@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime, timezone, time, timedelta
 import random
 
@@ -15,6 +15,53 @@ except Exception:
 ET = ZoneInfo('America/New_York')
 MT = ZoneInfo('America/Denver')
 
+# ---- Symbol normalization helpers ----
+def _normalize_symbol(symbol: str) -> str:
+    """Uppercase & strip separators, e.g. 'btc/usd' -> 'BTCUSD'."""
+    return symbol.replace("/", "").replace("-", "").upper().strip()
+
+_FIAT_SUFFIXES = ("USD", "USDT", "USDC", "EUR")
+
+_COMMON_CRYPTO_BASES = {
+    "BTC", "ETH", "SOL", "DOGE", "ADA", "LTC", "BCH", "AVAX", "MATIC", "SHIB",
+    "ETC", "XRP", "DOT", "LINK", "ATOM", "NEAR", "APT", "ARB", "OP", "PEPE",
+    "TON", "SUI", "ALGO", "FIL", "ICP", "AAVE", "UNI"
+}
+
+def _split_crypto(symbol: str) -> Tuple[str, str]:
+    """Return (BASE, QUOTE) for crypto-like symbols in 'BASE/QUOTE' or 'BASEQUOTE' forms."""
+    s = symbol.strip().upper()
+    if "/" in s:
+        base, quote = s.split("/", 1)
+        return base.strip(), quote.strip()
+    sn = _normalize_symbol(s)
+    for q in _FIAT_SUFFIXES:
+        if sn.endswith(q) and len(sn) > len(q):
+            return sn[:-len(q)], q
+    # Fallback (treat last 3 as quote)
+    return sn[:-3], sn[-3:]
+
+def _is_crypto_symbol(symbol: str) -> bool:
+    """Heuristic to classify crypto pairs."""
+    if "/" in symbol:
+        return True
+    sn = _normalize_symbol(symbol)
+    for q in _FIAT_SUFFIXES:
+        if sn.endswith(q) and len(sn) > len(q):
+            base = sn[:-len(q)]
+            return base in _COMMON_CRYPTO_BASES
+    return False
+
+def _to_alpaca_crypto_data_symbol(symbol: str) -> str:
+    """Alpaca DATA API expects 'BASE/QUOTE' for crypto (e.g., 'BTC/USD')."""
+    base, quote = _split_crypto(symbol)
+    return f"{base}/{quote}"
+
+def _to_alpaca_crypto_trading_symbol(symbol: str) -> str:
+    """Alpaca TRADING API expects 'BASEQUOTE' for crypto (e.g., 'BTCUSD')."""
+    base, quote = _split_crypto(symbol)
+    return f"{base}{quote}"
+
 @dataclass
 class Position:
     symbol: str
@@ -25,9 +72,7 @@ class BrokerBase:
     name = "base"
 
     def is_trading_window_open(self, symbol: str, allow_extended: bool = False):
-        """Return (is_open_now: bool, next_open_dt_et: datetime|None).
-        Base broker assumes always open.
-        """
+        """Return (is_open_now: bool, next_open_dt_et: datetime|None)."""
         return True, None
 
     def min_lot(self, symbol: str) -> float:
@@ -40,7 +85,7 @@ class BrokerBase:
         raise NotImplementedError
 
     def asset_class(self, symbol: str) -> str:
-        return "crypto" if "/" in symbol else "equity"
+        return "crypto" if _is_crypto_symbol(symbol) else "equity"
 
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
@@ -120,12 +165,12 @@ class AlpacaBroker(BrokerBase):
 
     def get_equity(self) -> float:
         acct = self.trading.get_account()
-        return float(acct.cash) + float(acct.portfolio_value) - float(acct.cash)  # portfolio_value as equity
-        # Alternatively: return float(acct.portfolio_value)
+        return float(acct.portfolio_value)
 
     def get_position(self, symbol: str) -> Optional[Position]:
         try:
-            p = self.trading.get_open_position(symbol.replace("/", ""))  # BTCUSD for crypto
+            sym = _to_alpaca_crypto_trading_symbol(symbol) if _is_crypto_symbol(symbol) else _normalize_symbol(symbol)
+            p = self.trading.get_open_position(sym)
         except Exception:
             return None
         try:
@@ -137,17 +182,15 @@ class AlpacaBroker(BrokerBase):
 
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         from alpaca.data.requests import StockLatestBarRequest, CryptoLatestBarRequest
-        from alpaca.data.timeframe import TimeFrame
-        tf_map = {"1m":"Minute", "5m":"Minute", "15m":"Minute", "1h":"Hour", "1d":"Day"}
-        # Alpaca latest bar endpoints ignore timeframe; we still poll each period
-        is_crypto = "/" in symbol
-        if is_crypto:
-            symbol_api = symbol.replace("/", "")
+        # DATA API: crypto requires "BASE/QUOTE"; equities use raw symbol
+        if _is_crypto_symbol(symbol):
+            symbol_api = _to_alpaca_crypto_data_symbol(symbol)   # e.g., BTC/USD
             req = CryptoLatestBarRequest(symbol_or_symbols=symbol_api)
             bar = self.crypto_data.get_crypto_latest_bar(req)[symbol_api]
         else:
-            req = StockLatestBarRequest(symbol_or_symbols=symbol)
-            bar = self.stock_data.get_stock_latest_bar(req)[symbol]
+            sym = _normalize_symbol(symbol)  # e.g., AAPL
+            req = StockLatestBarRequest(symbol_or_symbols=sym)
+            bar = self.stock_data.get_stock_latest_bar(req)[sym]
         return {
             "t": bar.timestamp.isoformat(),
             "o": float(bar.open),
@@ -162,22 +205,36 @@ class AlpacaBroker(BrokerBase):
         from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
         side = OrderSide.BUY if plan.side == "buy" else OrderSide.SELL
         qty = plan.qty
-        sym = symbol.replace("/", "")  # BTCUSD
-        order = MarketOrderRequest(
-            symbol=sym,
-            qty=qty,
-            side=side,
-            time_in_force=TimeInForce.GTC,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=round(float(plan.take_profit), 2)),
-            stop_loss=StopLossRequest(stop_price=round(float(plan.stop_loss), 2)),
-        )
-        res = self.trading.submit_order(order_data=order)
-        return res.id
+
+        if _is_crypto_symbol(symbol):
+            # Crypto does NOT support advanced/otoco (bracket) orders on Alpaca.
+            # Submit a simple market order and let the bot handle exits.
+            sym = _to_alpaca_crypto_trading_symbol(symbol)  # e.g., BTCUSD
+            order = MarketOrderRequest(
+                symbol=sym,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.GTC,
+            )
+            res = self.trading.submit_order(order_data=order)
+            return res.id
+        else:
+            sym = _normalize_symbol(symbol)  # e.g., AAPL
+            order = MarketOrderRequest(
+                symbol=sym,
+                qty=qty,
+                side=side,
+                time_in_force=TimeInForce.GTC,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=round(float(plan.take_profit), 2)),
+                stop_loss=StopLossRequest(stop_price=round(float(plan.stop_loss), 2)),
+            )
+            res = self.trading.submit_order(order_data=order)
+            return res.id
 
     def close_position(self, symbol: str, exit_price: float):
-        # Market-close position; Alpaca handles price. We'll compute pnl approximately
-        sym = symbol.replace("/", "")
+        # TRADING API uses 'BASEQUOTE' for crypto
+        sym = _to_alpaca_crypto_trading_symbol(symbol) if _is_crypto_symbol(symbol) else _normalize_symbol(symbol)
         try:
             pos = self.trading.get_open_position(sym)
         except Exception:
@@ -202,11 +259,8 @@ class AlpacaBroker(BrokerBase):
         return pre_open, pre_close, reg_open, reg_close, aft_open, aft_close
 
     def is_trading_window_open(self, symbol: str, allow_extended: bool = False):
-        """Return (is_open_now, next_open_dt_ET|None).
-        Crypto assumed 24/7. For equities, use Alpaca clock+calendar.
-        """
-        # Crypto path (BTC/USD etc.)
-        if "/" in symbol:
+        """Return (is_open_now, next_open_dt_ET|None).  Crypto is 24/7."""
+        if _is_crypto_symbol(symbol):
             return True, None
         try:
             clock = self.trading.get_clock()
@@ -214,8 +268,7 @@ class AlpacaBroker(BrokerBase):
             if not allow_extended:
                 if bool(getattr(clock, 'is_open', False)):
                     return True, None
-                # Compute next regular session open (9:30 ET) without relying on calendar
-                now_et = datetime.now(tz=ET)
+                # Compute next regular session open (9:30 ET)
                 wk = now_et.weekday()
                 reg_open = datetime.combine(now_et.date(), time(9,30), tzinfo=ET)
                 reg_close = datetime.combine(now_et.date(), time(16,0), tzinfo=ET)
@@ -283,7 +336,6 @@ class IbkrBroker(BrokerBase):
         return True, None
 
     def __init__(self, paper: bool = True):
-        # Minimal connection skeleton. You must have TWS/Gateway running.
         try:
             from ib_insync import IB
         except Exception as e:
@@ -303,11 +355,9 @@ class IbkrBroker(BrokerBase):
         return float(acct_vals.get("NetLiquidation", 0))
 
     def get_position(self, symbol: str) -> Optional[Position]:
-        # For brevity, not fully implemented in this skeleton.
         return None
 
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
-        # You can implement with IBKR's reqMktData or historicalData
         return None
 
     def submit_bracket(self, symbol: str, plan) -> str:
