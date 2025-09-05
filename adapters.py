@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 from datetime import datetime, timezone, time, timedelta
 import random
 
@@ -90,6 +90,11 @@ class BrokerBase:
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         raise NotImplementedError
 
+    # NEW: historical backfill
+    def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
+        """Return up to `limit` most recent CLOSED bars, oldest→newest. Each bar is {t,o,h,l,c,v} with t as ISO8601."""
+        raise NotImplementedError
+
     def submit_bracket(self, symbol: str, plan) -> str:
         raise NotImplementedError
 
@@ -117,12 +122,44 @@ class LocalPaperBroker(BrokerBase):
     def get_position(self, symbol: str) -> Optional[Position]:
         return self._positions.get(symbol)
 
+    def _tf_seconds(self, timeframe: str) -> int:
+        u = timeframe.strip().lower()
+        n = int(u[:-1]); k = u[-1]
+        return n * (60 if k == "m" else 3600 if k == "h" else 86400)
+
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         last = self._last_price.get(symbol, 100.0)
         new = max(0.01, last + random.uniform(-0.5, 0.5))
         self._last_price[symbol] = new
         iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
         return {"t": iso, "o": last, "h": max(last, new), "l": min(last, new), "c": new, "v": 1000}
+
+    def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
+        # Generate synthetic closed bars
+        tf = self._tf_seconds(timeframe)
+        now = int(datetime.now(timezone.utc).timestamp())
+        start_bucket = (now // tf) * tf - (limit * tf)
+        bars: List[Dict[str, Any]] = []
+        price = self._last_price.get(symbol, 100.0)
+        for i in range(limit):
+            t0 = start_bucket + i * tf
+            # simple random walk
+            close = max(0.01, price + random.uniform(-1.0, 1.0))
+            high = max(price, close) + random.uniform(0.0, 0.3)
+            low = min(price, close) - random.uniform(0.0, 0.3)
+            bars.append({
+                "t": datetime.fromtimestamp(t0 + tf, tz=timezone.utc).isoformat(timespec="seconds"),
+                "o": float(price),
+                "h": float(high),
+                "l": float(low),
+                "c": float(close),
+                "v": 1000.0
+            })
+            price = close
+        # set last price to last close so get_latest_bar continues smoothly
+        if bars:
+            self._last_price[symbol] = float(bars[-1]["c"])
+        return bars
 
     def submit_bracket(self, symbol: str, plan) -> str:
         qty = plan.qty if plan.side == "buy" else -plan.qty
@@ -180,9 +217,19 @@ class AlpacaBroker(BrokerBase):
         avg = float(p.avg_entry_price)
         return Position(symbol=symbol, qty=qty, avg_price=avg)
 
+    def _to_alpaca_tf(self, timeframe: str):
+        # Map like "5m","15m","1h","1d" → Alpaca TimeFrame
+        try:
+            from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+            tf = timeframe.strip().lower()
+            n = int(tf[:-1]); u = tf[-1]
+            unit = TimeFrameUnit.Minute if u == "m" else (TimeFrameUnit.Hour if u == "h" else TimeFrameUnit.Day)
+            return TimeFrame(amount=n, unit=unit)
+        except Exception as e:
+            raise RuntimeError(f"Unsupported timeframe '{timeframe}': {e}")
+
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         from alpaca.data.requests import StockLatestBarRequest, CryptoLatestBarRequest
-        # DATA API: crypto requires "BASE/QUOTE"; equities use raw symbol
         if _is_crypto_symbol(symbol):
             symbol_api = _to_alpaca_crypto_data_symbol(symbol)   # e.g., BTC/USD
             req = CryptoLatestBarRequest(symbol_or_symbols=symbol_api)
@@ -199,6 +246,33 @@ class AlpacaBroker(BrokerBase):
             "c": float(bar.close),
             "v": float(bar.volume or 0),
         }
+
+    def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
+        # Fetch most recent CLOSED bars, oldest→newest
+        tf = self._to_alpaca_tf(timeframe)
+        if _is_crypto_symbol(symbol):
+            from alpaca.data.requests import CryptoBarsRequest
+            sym = _to_alpaca_crypto_data_symbol(symbol)
+            req = CryptoBarsRequest(symbol_or_symbols=sym, timeframe=tf, limit=limit)
+            out = self.crypto_data.get_crypto_bars(req).data[sym]
+        else:
+            from alpaca.data.requests import StockBarsRequest
+            sym = _normalize_symbol(symbol)
+            req = StockBarsRequest(symbol_or_symbols=sym, timeframe=tf, limit=limit)
+            out = self.stock_data.get_stock_bars(req).data[sym]
+        bars: List[Dict[str, Any]] = []
+        for b in out:
+            bars.append({
+                "t": b.timestamp.isoformat(),
+                "o": float(b.open),
+                "h": float(b.high),
+                "l": float(b.low),
+                "c": float(b.close),
+                "v": float(b.volume or 0),
+            })
+        # Ensure chronological order (oldest→newest)
+        bars.sort(key=lambda x: x["t"])
+        return bars
 
     def submit_bracket(self, symbol: str, plan) -> str:
         from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
@@ -359,6 +433,9 @@ class IbkrBroker(BrokerBase):
 
     def get_latest_bar(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         return None
+
+    def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
+        return []
 
     def submit_bracket(self, symbol: str, plan) -> str:
         raise NotImplementedError("Implement IBKR bracket submission with ib_insync.")

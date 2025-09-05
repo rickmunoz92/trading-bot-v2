@@ -14,7 +14,7 @@ except Exception:
 MT = ZoneInfo('America/Denver')
 ET = ZoneInfo('America/New_York')
 
-from typing import Optional, Dict, Any, Tuple, Callable
+from typing import Optional, Dict, Any, Tuple, Callable, List
 import random
 from queue import Queue, Empty
 
@@ -415,6 +415,23 @@ def main() -> None:
                 return state
             return bool(state), None
 
+    # ---------- Startup backfill for EMA seeding ----------
+    try:
+        hist_limit = max(cfg.fast, cfg.slow) * 3
+        bars: List[Dict[str, Any]] = _retry_broker(
+            stop_event, responsive_sleep, "get_recent_bars",
+            broker.get_recent_bars, cfg.symbol, cfg.timeframe, hist_limit,
+            tries=2, base=0.25, cap=1.0, timeout=3.0, max_total_seconds=_market_call_budget()
+        ) or []
+        # Feed historical CLOSED bars (oldest→newest) into the strategy
+        for b in bars:
+            strategy.ingest(b)
+        # Prime prev_rel without emitting a signal line
+        _ = strategy.signal()
+    except Exception as e:
+        print(R.warn(f"Historical backfill unavailable: {e}"))
+    # -----------------------------------------------------
+
     # ---------- Reconciliation & enforcement (use price_fetch) ----------
     def _reconcile_on_start(cfg: Config, broker: BrokerBase, journal: Journal) -> Optional[Dict[str, Any]]:
         pos = get_position_safe()
@@ -570,7 +587,7 @@ def main() -> None:
                     last_bucket_sec = bucket_now
                     prev_bar = bar_now
 
-            # --- Header (now includes strategy EMA values when available) ---
+            # --- Header (includes EMA values when available) ---
             header = f"{human_ts(now_utc_iso())} " + format_header(
                 cfg, broker, current_price=display_price, action=action, strategy_state=getattr(strategy, "debug_state", lambda: {})()
             )
