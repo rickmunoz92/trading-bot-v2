@@ -187,6 +187,30 @@ def _apply_side_filter(action: str, side_pref: str) -> str:
         return "hold"
     return action
 
+# ---- Timeframe helpers to ensure 1 update per completed bar ----
+_TF_RE = re.compile(r"^\s*(\d+)\s*([mhd])\s*$", re.IGNORECASE)
+
+def _parse_timeframe_seconds(tf: str) -> int:
+    """
+    Convert '5m'/'15m'/'1h'/'1d' to seconds.
+    Defaults to 60s if unparseable to be safe.
+    """
+    m = _TF_RE.match(tf or "")
+    if not m:
+        return 60
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "m":
+        return n * 60
+    if unit == "h":
+        return n * 3600
+    if unit == "d":
+        return n * 86400
+    return 60
+
+def _iso_to_dt(s: str) -> datetime:
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
 def main() -> None:
     cfg = parse_args()
 
@@ -227,7 +251,10 @@ def main() -> None:
 
     journal = Journal(symbol=cfg.symbol)
 
-    last_bar_ts: Optional[str] = None
+    # Track bar buckets so we only ingest on COMPLETED bars.
+    tf_secs = _parse_timeframe_seconds(cfg.timeframe)
+    last_bucket_sec: Optional[int] = None
+    prev_bar: Optional[Dict[str, Any]] = None
     open_position = broker.get_position(cfg.symbol)
 
     try:
@@ -250,28 +277,57 @@ def main() -> None:
                 responsive_sleep(cfg.poll)
                 continue
 
-            # --- Fetch market data ---
-            bar = broker.get_latest_bar(cfg.symbol, cfg.timeframe)
-            if not bar:
+            # --- Fetch market data (latest 1-bar snapshot from broker) ---
+            bar_now = broker.get_latest_bar(cfg.symbol, cfg.timeframe)
+            if not bar_now:
                 print(R.warn("No market data yet."))
                 responsive_sleep(cfg.poll)
                 continue
-            last_bar_ts = bar["t"]
 
-            # --- Strategy ---
-            strategy.ingest(bar)
-            signal_out = strategy.signal()
-            action = signal_out.get("action", "hold")
+            # Compute timeframe bucket of the incoming bar timestamp.
+            try:
+                dt_now = _iso_to_dt(bar_now["t"])
+                sec_now = int(dt_now.timestamp())
+                bucket_now = (sec_now // tf_secs) * tf_secs
+            except Exception:
+                # If timestamp parsing fails, fall back to processing every poll as if new bar
+                bucket_now = None
 
-            # Apply side preference
-            action = _apply_side_filter(action, cfg.side)
+            action = "hold"
+            display_price = float(bar_now.get("c", 0.0))
+
+            # First loop: initialize tracking but DO NOT ingest yet (we need a close of the bucket).
+            if last_bucket_sec is None:
+                last_bucket_sec = bucket_now
+                prev_bar = bar_now
+            else:
+                if bucket_now == last_bucket_sec:
+                    # Still within the same timeframe bucket => update prev_bar and skip strategy updates.
+                    prev_bar = bar_now
+                else:
+                    # We have moved into a NEW bucket: process the PREVIOUS bar snapshot as the completed bar.
+                    effective_bar = prev_bar or bar_now
+                    display_price = float(effective_bar.get("c", display_price))
+
+                    # --- Strategy ---
+                    strategy.ingest(effective_bar)
+                    signal_out = strategy.signal()
+                    action = signal_out.get("action", "hold")
+
+                    # Apply side preference
+                    action = _apply_side_filter(action, cfg.side)
+
+                    # Update last_bucket to current
+                    last_bucket_sec = bucket_now
+                    # Carry forward prev_bar for next round
+                    prev_bar = bar_now
 
             # --- Header (each poll with TP/SL) ---
-            header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=bar["c"], action=action)
+            header = f"{human_ts(now_utc_iso())} " + format_header(cfg, broker, current_price=display_price, action=action)
 
             # --- Status line ---
             line = [
-                R.kv("price", f"{bar['c']:.4f}"),
+                R.kv("price", f"{display_price:.4f}"),
                 R.kv("sig", action),
                 R.kv("hit", "yes" if _strategy_hit(action) else "no"),
             ]
@@ -283,7 +339,7 @@ def main() -> None:
             # --- Execute ---
             if action in ("enter_long", "enter_short") and not open_position:
                 side = "buy" if action == "enter_long" else "sell"
-                entry = bar["c"]
+                entry = display_price
                 tmp_plan = plan_bracket(side, entry, cfg.tp_pct, cfg.sl_pct, qty=0, meta={})
                 qty = risk_size_qty(broker.get_equity(), cfg.risk_pct, entry, tmp_plan.stop_loss, lot_size=broker.min_lot(cfg.symbol))
                 if qty <= 0:
@@ -305,7 +361,7 @@ def main() -> None:
                     )
 
             elif action == "exit" and open_position:
-                exit_price = bar["c"]
+                exit_price = display_price
                 pnl_abs, pnl_pct = broker.close_position(cfg.symbol, exit_price)
                 journal.on_exit(
                     when=now_utc_iso(),
