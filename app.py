@@ -404,7 +404,7 @@ def main() -> None:
 
     # ---------- Startup backfill for EMA seeding ----------
     try:
-        hist_limit = max(cfg.fast, cfg.slow) * 3
+        hist_limit = max(cfg.fast, cfg.slow) * 5
         bars: List[Dict[str, Any]] = _retry_broker(
             stop_event, responsive_sleep, "get_recent_bars",
             broker.get_recent_bars, cfg.symbol, cfg.timeframe, hist_limit,
@@ -413,6 +413,18 @@ def main() -> None:
         for b in bars:
             strategy.ingest(b)  # CLOSED bars oldest→newest
         _ = strategy.signal()  # prime without header print
+
+        # Track timestamps for duplicate-safe ingestion
+        try:
+            last_backfill_t = bars[-1]["t"] if bars else None
+        except Exception:
+            last_backfill_t = None
+        last_ingested_t = last_backfill_t
+        try:
+            _ds = getattr(strategy, "debug_state", lambda: {})()
+            print(R.dim(f"Backfill fetched {len(bars) if 'bars' in locals() and isinstance(bars, list) else 0} bars; ready={_ds.get('ready')} bars_until_ready={_ds.get('bars_until_ready')}"))
+        except Exception:
+            pass
     except Exception as e:
         print(R.warn(f"Historical backfill unavailable: {e}"))
     # -----------------------------------------------------
@@ -589,6 +601,39 @@ def main() -> None:
             # Bar gating for strategy updates
             if last_bucket_sec is None:
                 last_bucket_sec = bucket_now
+                # Ensure EMAs are ready on first poll: if not, feed the most recent CLOSED bar once.
+                try:
+                    _ds = getattr(strategy, "debug_state", lambda: {})()
+                    _ready = bool(_ds.get("ready"))
+                except Exception:
+                    _ready = False
+                try:
+                    if not _ready:
+                        try:
+                            # Pull exactly one most recent CLOSED bar
+                            _latest_closed = _retry_broker(
+                                stop_event, responsive_sleep, "get_recent_bars",
+                                broker.get_recent_bars, cfg.symbol, cfg.timeframe, 1,
+                                tries=2, base=0.25, cap=1.0, timeout=2.5,
+                                max_total_seconds=_market_call_budget()
+                            ) or []
+                        except Exception:
+                            _latest_closed = []
+                        _bar_seed = _latest_closed[-1] if _latest_closed else bar_now
+                        _t_seed = _bar_seed.get("t")
+                        # Only ingest if we didn't already ingest this exact bar during backfill
+                        _should_ingest = True
+                        if last_backfill_t is not None:
+                            try:
+                                _should_ingest = (_t_seed != last_backfill_t)
+                            except Exception:
+                                _should_ingest = True
+                        if _should_ingest and (_t_seed != last_ingested_t):
+                            strategy.ingest(_bar_seed)
+                            last_ingested_t = _t_seed
+                            _ = strategy.signal()  # update strategy state after ingest
+                except Exception:
+                    pass
                 prev_bar = bar_now
             else:
                 if bucket_now == last_bucket_sec:
