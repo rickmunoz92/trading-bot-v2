@@ -208,6 +208,51 @@ class AlpacaBroker(BrokerBase):
         self.stock_data = StockHistoricalDataClient(api_key, secret)
         self.crypto_data = CryptoHistoricalDataClient(api_key, secret)
 
+    
+    def get_bars_range(self, symbol: str, timeframe: str, start_iso: str, end_iso: str, max_bars: int = 2000, chunk: int = 500) -> List[Dict[str, Any]]:
+        """Fetch CLOSED bars between [start_iso, end_iso], chunking requests to avoid short-window/limit issues.
+        Returns oldest→newest bars (up to max_bars)."""
+        tf = self._to_alpaca_tf(timeframe)
+        bars: List[Dict[str, Any]] = []
+        current_end = end_iso
+        while len(bars) < max_bars:
+            want = min(chunk, max_bars - len(bars))
+            if _is_crypto_symbol(symbol):
+                from alpaca.data.requests import CryptoBarsRequest
+                sym = _to_alpaca_crypto_data_symbol(symbol)
+                req = CryptoBarsRequest(symbol_or_symbols=sym, timeframe=tf, start=start_iso, end=current_end, limit=want)
+                out = self.crypto_data.get_crypto_bars(req).data.get(sym, [])
+            else:
+                from alpaca.data.requests import StockBarsRequest
+                sym = _normalize_symbol(symbol)
+                req = StockBarsRequest(symbol_or_symbols=sym, timeframe=tf, start=start_iso, end=current_end, limit=want)
+                out = self.stock_data.get_stock_bars(req).data.get(sym, [])
+            chunk_bars: List[Dict[str, Any]] = []
+            for b in out:
+                chunk_bars.append({
+                    "t": b.timestamp.isoformat(),
+                    "o": float(b.open),
+                    "h": float(b.high),
+                    "l": float(b.low),
+                    "c": float(b.close),
+                    "v": float(b.volume or 0),
+                })
+            if not chunk_bars:
+                break
+            # Ensure chronological, then append
+            chunk_bars.sort(key=lambda x: x["t"])
+            bars = chunk_bars + bars if (bars and chunk_bars[0]["t"] < bars[0]["t"]) else bars + chunk_bars
+            # Move the end cursor to just before the earliest we've got
+            earliest = chunk_bars[0]["t"]
+            try:
+                from datetime import datetime, timezone, timedelta
+                earliest_dt = datetime.fromisoformat(earliest.replace("Z","+00:00"))
+                current_end = (earliest_dt - timedelta(seconds=1)).isoformat()
+            except Exception:
+                break
+        # Final chronological order oldest→newest
+        bars.sort(key=lambda x: x["t"])
+        return bars
     def min_lot(self, symbol: str) -> float:
         return 1.0 if self.asset_class(symbol) == "equity" else 0.0001
 

@@ -404,15 +404,57 @@ def main() -> None:
 
     # ---------- Startup backfill for EMA seeding ----------
     try:
-        hist_limit = max(cfg.fast, cfg.slow) * 5
-        bars: List[Dict[str, Any]] = _retry_broker(
-            stop_event, responsive_sleep, "get_recent_bars",
-            broker.get_recent_bars, cfg.symbol, cfg.timeframe, hist_limit,
-            tries=2, base=0.25, cap=1.0, timeout=3.0, max_total_seconds=_market_call_budget()
-        ) or []
-        for b in bars:
-            strategy.ingest(b)  # CLOSED bars oldest→newest
-        _ = strategy.signal()  # prime without header print
+        # Prefer a time-bounded, chunked backfill to avoid short 'recent' windows
+        tf_secs = _parse_timeframe_seconds(cfg.timeframe)
+        # Initial lookback window: 5× slow period
+        lookback_bars = max(cfg.slow * 5, cfg.slow + 10)
+        from datetime import timedelta
+        end_dt = datetime.now(timezone.utc)
+        start_dt = end_dt - timedelta(seconds=lookback_bars * tf_secs)
+        attempts = 0
+        max_limit = 8000  # hard cap on total bars
+        while True:
+            attempts += 1
+            # Use time-bounded range if broker supports it
+            bars: List[Dict[str, Any]] = []
+            if hasattr(broker, "get_bars_range"):
+                bars = _retry_broker(
+                    stop_event, responsive_sleep, "get_bars_range",
+                    getattr(broker, "get_bars_range"), cfg.symbol, cfg.timeframe,
+                    start_dt.isoformat(), end_dt.isoformat(),
+                    min(max_limit, lookback_bars),  # max_bars
+                    500,  # chunk
+                    tries=2, base=0.25, cap=1.0, timeout=4.0,
+                    max_total_seconds=_market_call_budget()
+                ) or []
+            else:
+                # Fallback to limit-based recent bars if range is unavailable
+                hist_limit = min(max_limit, lookback_bars)
+                bars = _retry_broker(
+                    stop_event, responsive_sleep, "get_recent_bars",
+                    broker.get_recent_bars, cfg.symbol, cfg.timeframe, hist_limit,
+                    tries=2, base=0.25, cap=1.0, timeout=3.0, max_total_seconds=_market_call_budget()
+                ) or []
+
+            # Re-seed a fresh strategy and ingest CLOSED bars (oldest→newest)
+            strategy = get_strategy(cfg.strategy_name)(fast=cfg.fast, slow=cfg.slow)
+            for b in bars:
+                strategy.ingest(b)
+            _ = strategy.signal()
+
+            try:
+                _ds0 = getattr(strategy, "debug_state", lambda: {})()
+                print(R.dim(f"Backfill fetched {len(bars)} bars (attempt {attempts}, window={lookback_bars}); ready={_ds0.get('ready')} bars_until_ready={_ds0.get('bars_until_ready')}"))
+            except Exception:
+                pass
+
+            if getattr(strategy, "debug_state", lambda: {})().get("ready"):
+                break
+            if lookback_bars >= max_limit:
+                break
+            # Expand window and try again
+            lookback_bars = min(max_limit, lookback_bars * 2)
+            start_dt = end_dt - timedelta(seconds=lookback_bars * tf_secs)
 
         # Track timestamps for duplicate-safe ingestion
         try:
@@ -420,14 +462,12 @@ def main() -> None:
         except Exception:
             last_backfill_t = None
         last_ingested_t = last_backfill_t
-        try:
-            _ds = getattr(strategy, "debug_state", lambda: {})()
-            print(R.dim(f"Backfill fetched {len(bars) if 'bars' in locals() and isinstance(bars, list) else 0} bars; ready={_ds.get('ready')} bars_until_ready={_ds.get('bars_until_ready')}"))
-        except Exception:
-            pass
+
     except Exception as e:
         print(R.warn(f"Historical backfill unavailable: {e}"))
-    # -----------------------------------------------------
+        last_backfill_t = None
+        last_ingested_t = None
+# -----------------------------------------------------# -----------------------------------------------------# -----------------------------------------------------
 
     # ---------- Reconciliation & enforcement ----------
     def _reconcile_on_start(cfg: Config, broker: BrokerBase, journal: Journal) -> Optional[Dict[str, Any]]:
