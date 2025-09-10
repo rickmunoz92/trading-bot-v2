@@ -357,12 +357,12 @@ class AlpacaBroker(BrokerBase):
             from alpaca.data.requests import CryptoBarsRequest
             sym = _to_alpaca_crypto_data_symbol(symbol)
             req = CryptoBarsRequest(symbol_or_symbols=sym, timeframe=tf, limit=limit)
-            out = self.crypto_data.get_crypto_bars(req).data[sym]
+            out = self.crypto_data.get_crypto_bars(req).data.get(sym, [])
         else:
             from alpaca.data.requests import StockBarsRequest
             sym = _normalize_symbol(symbol)
             req = StockBarsRequest(symbol_or_symbols=sym, timeframe=tf, limit=limit)
-            out = self.stock_data.get_stock_bars(req).data[sym]
+            out = self.stock_data.get_stock_bars(req).data.get(sym, [])
         bars: List[Dict[str, Any]] = []
         for b in out:
             bars.append({

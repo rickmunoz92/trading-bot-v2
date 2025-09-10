@@ -363,31 +363,35 @@ def main() -> None:
         # Use up to 60% of poll interval for live data calls (never < 2s, never > 6s)
         return max(2.0, min(6.0, cfg.poll * 0.6))
     # DISPLAY price: live quote mid (crypto) or latest trade; fallback to bar close
-    def price_fetch() -> Tuple[Optional[float], str]:
-        """Best-effort live price: prefer quote mid for crypto, else last trade; returns (price, src)."""
+    def price_fetch(allow_quote: bool = False) -> Tuple[Optional[float], str]:
+        """Best-effort live price with throttled quote usage.
+        Prefer latest trade for stability; optionally use quote mid for crypto when allowed.
+        Returns (price, src).
+        """
         src = 'trade'
-        # Try latest quote first for crypto to match Alpaca's mid price
-        try:
-            if hasattr(broker, 'get_latest_quote') and broker.asset_class(cfg.symbol) == 'crypto':
-                qt = _retry_broker(
-                    stop_event, responsive_sleep, 'get_latest_quote',
-                    broker.get_latest_quote, cfg.symbol,
-                    tries=2, base=0.25, cap=1.0, timeout=2.0,
-                    max_total_seconds=_market_call_budget()
-                )
-                if qt:
-                    bp = float(qt.get('bp', 0.0) or 0.0)
-                    ap = float(qt.get('ap', 0.0) or 0.0)
-                    if bp > 0 and ap > 0:
-                        return ((bp + ap) / 2.0, 'quote')
-        except Exception:
-            pass
-        # Fall back to latest trade
+        # Throttled latest quote (crypto only)
+        if allow_quote:
+            try:
+                if hasattr(broker, 'get_latest_quote') and broker.asset_class(cfg.symbol) == 'crypto':
+                    qt = _retry_broker(
+                        stop_event, responsive_sleep, 'get_latest_quote',
+                        broker.get_latest_quote, cfg.symbol,
+                        tries=3, base=0.5, cap=2.0, timeout=3.0,
+                        max_total_seconds=_market_call_budget()
+                    )
+                    if qt:
+                        bp = float(qt.get('bp', 0.0) or 0.0)
+                        ap = float(qt.get('ap', 0.0) or 0.0)
+                        if bp > 0 and ap > 0:
+                            return ((bp + ap) / 2.0, 'quote')
+            except Exception:
+                pass
+        # Latest trade (all assets)
         try:
             tr = _retry_broker(
                 stop_event, responsive_sleep, 'get_latest_trade',
                 broker.get_latest_trade, cfg.symbol,
-                tries=2, base=0.25, cap=1.0, timeout=2.0,
+                tries=3, base=0.5, cap=2.0, timeout=3.0,
                 max_total_seconds=_market_call_budget()
             )
             if tr:
@@ -404,7 +408,7 @@ def main() -> None:
             return _retry_broker(
                 stop_event, responsive_sleep, "get_position",
                 broker.get_position, cfg.symbol,
-                tries=3, base=0.25, cap=1.0, timeout=2.5,
+                tries=3, base=0.5, cap=2.0, timeout=3.0,
                 max_total_seconds=_market_call_budget()
             )
         except Exception as e:
@@ -508,7 +512,7 @@ def main() -> None:
         side = _infer_side_from_position(pos)
         tp = avg * (1 + cfg.tp_pct / 100.0) if side == "long" else avg * (1 - cfg.tp_pct / 100.0)
         sl = avg * (1 - cfg.sl_pct / 100.0) if side == "long" else avg * (1 + cfg.sl_pct / 100.0)
-        price, _src = price_fetch()
+        price, _src = price_fetch(allow_quote=allow_quote)
         if price is None:
             return pos
         hit = _breach_for_side(side, price, tp, sl)
@@ -540,7 +544,7 @@ def main() -> None:
         avg = float(getattr(open_position, 'avg_price', 0.0))
         if avg <= 0:
             return open_position
-        price, _src = price_fetch()
+        price, _src = price_fetch(allow_quote=allow_quote)
         if price is None:
             return open_position
         side = _infer_side_from_position(open_position)
@@ -572,9 +576,14 @@ def main() -> None:
     # --- Startup reconcile
     open_position = _reconcile_on_start(cfg, broker, journal)
 
+    loop_counter = 0
     try:
         while not stop_event.is_set():
             loop_start = time.monotonic()
+            loop_counter += 1
+            # Throttle quote calls: once every ~5 loops (or ~10% of poll-derived cadence)
+            quote_every = max(5, int(max(1, cfg.poll // 10)))
+            allow_quote = (loop_counter % quote_every == 0)
 
             # --- Trading window guard ---
             try:
@@ -592,14 +601,20 @@ def main() -> None:
 
             # --- Fetch market data (budgeted retry) ---
             try:
-                bar_now = _retry_broker(
-                    stop_event, responsive_sleep, "get_latest_bar",
-                    broker.get_latest_bar, cfg.symbol, cfg.timeframe,
-                    tries=2, base=0.25, cap=1.0, timeout=2.0,
+                latest_bars = _retry_broker(
+                    stop_event, responsive_sleep, "get_recent_bars",
+                    broker.get_recent_bars, cfg.symbol, cfg.timeframe, 1,
+                    tries=3, base=0.5, cap=2.0, timeout=3.0,
                     max_total_seconds=_market_call_budget()
                 )
+                bar_now = latest_bars[0] if latest_bars else None
             except Exception as e:
-                print(R.warn(f"get_latest_bar failed: {e}"))
+                msg = str(e)
+                if '429' in msg or 'Too Many Requests' in msg:
+                    print(R.warn("Rate limit reached, pausing for 60s"))
+                    responsive_sleep(60)
+                else:
+                    print(R.warn(f"get_recent_bars failed: {e}"))
                 pace_sleep(loop_start, cfg.poll)
                 continue
 
@@ -620,7 +635,7 @@ def main() -> None:
             action = "hold"
 
             # DISPLAY price uses live quote mid (crypto) or latest trade; fallback to bar close
-            display_price, price_src = price_fetch()
+            display_price, price_src = price_fetch(allow_quote=allow_quote)
             if display_price is None:
                 display_price = float(bar_now.get("c", 0.0))
                 price_src = 'bar'
@@ -747,7 +762,7 @@ def main() -> None:
                     equity = _retry_broker(
                         stop_event, responsive_sleep, "get_equity",
                         broker.get_equity,
-                        tries=2, base=0.25, cap=1.0, timeout=2.0,
+                        tries=3, base=0.5, cap=2.0, timeout=3.0,
                         max_total_seconds=_market_call_budget()
                     )
                 except Exception as e:
@@ -771,7 +786,7 @@ def main() -> None:
                     order_id = _retry_broker(
                         stop_event, responsive_sleep, "submit_bracket",
                         broker.submit_bracket, cfg.symbol, plan,
-                        tries=2, base=0.25, cap=1.0, timeout=3.0,
+                        tries=3, base=0.5, cap=2.0, timeout=3.0,
                         max_total_seconds=_market_call_budget()
                     )
                 except Exception as e:
