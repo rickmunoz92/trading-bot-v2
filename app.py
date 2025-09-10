@@ -241,6 +241,27 @@ def _breach_for_side(side: str, price: float, tp: float, sl: float) -> Optional[
             return "sl"
     return None
 
+def _pos_dir_from_broker(pos) -> int:
+    """Map broker position to strategy dir: +1 long, -1 short, 0 flat."""
+    if not pos:
+        return 0
+    try:
+        qty = float(getattr(pos, 'qty', 0.0))
+        if qty > 0:
+            return 1
+        if qty < 0:
+            return -1
+    except Exception:
+        pass
+    try:
+        side = getattr(pos, 'side', None)
+        if side in ('long','short'):
+            return 1 if side=='long' else -1
+    except Exception:
+        pass
+    return 0
+
+
 
 # ---------------- Broker call timeout + retry (with budget) -------------------
 
@@ -617,6 +638,14 @@ def main() -> None:
                         open_position = pos_now
             except Exception as e:
                 print(R.warn(f"position re-sync failed: {e}"))
+            
+            # NEW: synchronize strategy position to broker before any signal logic
+            try:
+                dir_now = _pos_dir_from_broker(open_position)
+                if hasattr(strategy, 'set_position_dir'):
+                    strategy.set_position_dir(dir_now)
+            except Exception:
+                pass
             # ------------------------------------------------------------------------------
 
             # ---------- Enforce TP/SL before strategy ----------
