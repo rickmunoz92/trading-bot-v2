@@ -12,6 +12,13 @@ class StrategyBase:
     def debug_state(self) -> Dict[str, Any]:
         return {}
 
+    def set_position_dir(self, dir: int) -> None:
+        """
+        dir: +1 (broker net long), -1 (broker net short), 0 (flat)
+        Default no-op; strategies override if they track pos_dir.
+        """
+        pass
+
 class EmaCross(StrategyBase):
     """
     EMA Cross strategy with SMA-seeded EMA initialization to match chart platforms.
@@ -46,6 +53,10 @@ class EmaCross(StrategyBase):
         # Cached multipliers
         self.k_fast = 2.0 / (self.fast + 1.0)
         self.k_slow = 2.0 / (self.slow + 1.0)
+
+    def set_position_dir(self, dir: int) -> None:
+        if dir in (-1, 0, 1):
+            self.pos_dir = dir
 
     @staticmethod
     def _sign(x: float) -> int:
