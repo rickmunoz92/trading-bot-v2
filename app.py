@@ -724,13 +724,21 @@ def main() -> None:
                 if bucket_now == last_bucket_sec:
                     prev_bar = bar_now
                 else:
-                    effective_bar = prev_bar or bar_now  # use last CLOSED bar
-                    strategy.ingest(effective_bar)
+                    # A new timeframe bucket started => the previous bar just CLOSED.
+                    # Ingest the freshly closed bar (bar_now) so EMAs update on time.
+                    try:
+                        _t_now = bar_now.get("t")
+                    except Exception:
+                        _t_now = None
+                    if (_t_now is None) or (_t_now != last_ingested_t):
+                        strategy.ingest(bar_now)
+                        last_ingested_t = _t_now
                     signal_out = strategy.signal()
                     action = signal_out.get("action", "hold")
                     action = _apply_side_filter(action, cfg.side)
                     last_bucket_sec = bucket_now
-                    prev_bar = bar_now
+                # Track the latest closed bar for reference
+                prev_bar = bar_now
 
             # --- Header (includes EMA values when available) ---
             header_line = f"{human_ts(now_utc_iso())} " + format_header(
