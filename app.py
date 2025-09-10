@@ -55,23 +55,30 @@ class OrderPlan:
 
 def format_strategy_label(name: str, fast: int, slow: int, state: Optional[Dict[str, Any]] = None) -> str:
     """
-    If debug `state` contains EMA values, include them:
-      'EMA Cross (9=112770.5455 / 21=112688.6210)'
-    Otherwise:
-      'EMA Cross (9/21)'
+    Build a concise label for console header.
+      - EMA Cross: show live EMA values if available.
+      - First Candle: show initial range if available.
     """
-    names = {"ema_cross": "EMA Cross"}
+    names = {"ema_cross": "EMA Cross", "first_candle": "First Candle"}
     label = names.get(name, name.replace("_", " ").title())
-    if state:
-        ef = state.get("ema_fast")
-        es = state.get("ema_slow")
-        def _fmt(v):
-            try:
-                return f"{float(v):.4f}"
-            except Exception:
-                return str(v)
+
+    def _fmt4(v):
+        try:
+            return f"{float(v):.4f}"
+        except Exception:
+            return str(v)
+
+    if name == "ema_cross" and state:
+        ef = state.get("ema_fast"); es = state.get("ema_slow")
         if ef is not None and es is not None:
-            return f"{label} ({fast}={_fmt(ef)} / {slow}={_fmt(es)})"
+            return f"{label} ({fast}={_fmt4(ef)} / {slow}={_fmt4(es)})"
+
+    if name == "first_candle" and state:
+        hi = state.get("initial_high"); lo = state.get("initial_low")
+        if hi is not None and lo is not None:
+            return f"{label} (H={_fmt4(hi)} / L={_fmt4(lo)})"
+
+    # Fallback
     return f"{label} ({fast}/{slow})"
 
 def human_ts(ts: str) -> str:
@@ -241,27 +248,6 @@ def _breach_for_side(side: str, price: float, tp: float, sl: float) -> Optional[
             return "sl"
     return None
 
-def _pos_dir_from_broker(pos) -> int:
-    """Map broker position to strategy dir: +1 long, -1 short, 0 flat."""
-    if not pos:
-        return 0
-    try:
-        qty = float(getattr(pos, 'qty', 0.0))
-        if qty > 0:
-            return 1
-        if qty < 0:
-            return -1
-    except Exception:
-        pass
-    try:
-        side = getattr(pos, 'side', None)
-        if side in ('long','short'):
-            return 1 if side=='long' else -1
-    except Exception:
-        pass
-    return 0
-
-
 
 # ---------------- Broker call timeout + retry (with budget) -------------------
 
@@ -376,21 +362,42 @@ def main() -> None:
     def _market_call_budget() -> float:
         # Use up to 60% of poll interval for live data calls (never < 2s, never > 6s)
         return max(2.0, min(6.0, cfg.poll * 0.6))
-
-    # DISPLAY price: latest trade (matches Alpaca UI). Signals still use CLOSED bars.
-    def price_fetch() -> Optional[float]:
+    # DISPLAY price: live quote mid (crypto) or latest trade; fallback to bar close
+    def price_fetch() -> Tuple[Optional[float], str]:
+        """Best-effort live price: prefer quote mid for crypto, else last trade; returns (price, src)."""
+        src = 'trade'
+        # Try latest quote first for crypto to match Alpaca's mid price
+        try:
+            if hasattr(broker, 'get_latest_quote') and broker.asset_class(cfg.symbol) == 'crypto':
+                qt = _retry_broker(
+                    stop_event, responsive_sleep, 'get_latest_quote',
+                    broker.get_latest_quote, cfg.symbol,
+                    tries=2, base=0.25, cap=1.0, timeout=2.0,
+                    max_total_seconds=_market_call_budget()
+                )
+                if qt:
+                    bp = float(qt.get('bp', 0.0) or 0.0)
+                    ap = float(qt.get('ap', 0.0) or 0.0)
+                    if bp > 0 and ap > 0:
+                        return ((bp + ap) / 2.0, 'quote')
+        except Exception:
+            pass
+        # Fall back to latest trade
         try:
             tr = _retry_broker(
-                stop_event, responsive_sleep, "get_latest_trade",
+                stop_event, responsive_sleep, 'get_latest_trade',
                 broker.get_latest_trade, cfg.symbol,
                 tries=2, base=0.25, cap=1.0, timeout=2.0,
                 max_total_seconds=_market_call_budget()
             )
             if tr:
-                return float(tr.get("p", None))
+                p = tr.get('p', None)
+                if p is not None:
+                    return (float(p), 'trade')
         except Exception:
-            return None
-        return None
+            return (None, src)
+        return (None, src)
+
 
     def get_position_safe() -> Optional[Dict[str, Any]]:
         try:
@@ -501,7 +508,7 @@ def main() -> None:
         side = _infer_side_from_position(pos)
         tp = avg * (1 + cfg.tp_pct / 100.0) if side == "long" else avg * (1 - cfg.tp_pct / 100.0)
         sl = avg * (1 - cfg.sl_pct / 100.0) if side == "long" else avg * (1 + cfg.sl_pct / 100.0)
-        price = price_fetch()
+        price, _src = price_fetch()
         if price is None:
             return pos
         hit = _breach_for_side(side, price, tp, sl)
@@ -533,7 +540,7 @@ def main() -> None:
         avg = float(getattr(open_position, 'avg_price', 0.0))
         if avg <= 0:
             return open_position
-        price = price_fetch()
+        price, _src = price_fetch()
         if price is None:
             return open_position
         side = _infer_side_from_position(open_position)
@@ -612,10 +619,11 @@ def main() -> None:
 
             action = "hold"
 
-            # DISPLAY price uses latest trade
-            display_price = price_fetch()
+            # DISPLAY price uses live quote mid (crypto) or latest trade; fallback to bar close
+            display_price, price_src = price_fetch()
             if display_price is None:
                 display_price = float(bar_now.get("c", 0.0))
+                price_src = 'bar'
 
             # --- Re-sync broker position each loop (detect manual closes/opens) ---
             try:
@@ -638,14 +646,6 @@ def main() -> None:
                         open_position = pos_now
             except Exception as e:
                 print(R.warn(f"position re-sync failed: {e}"))
-            
-            # NEW: synchronize strategy position to broker before any signal logic
-            try:
-                dir_now = _pos_dir_from_broker(open_position)
-                if hasattr(strategy, 'set_position_dir'):
-                    strategy.set_position_dir(dir_now)
-            except Exception:
-                pass
             # ------------------------------------------------------------------------------
 
             # ---------- Enforce TP/SL before strategy ----------
@@ -659,6 +659,7 @@ def main() -> None:
                     )
                     line = [
                         R.kv("price", f"{display_price:.4f}"),
+                R.kv("src", price_src),
                         R.kv("sig", "exit (tp/sl)"),
                         R.kv("hit", "n/a"),
                     ]
@@ -725,6 +726,7 @@ def main() -> None:
             # --- Status line ---
             line = [
                 R.kv("price", f"{display_price:.4f}"),
+                R.kv("src", price_src),
                 R.kv("sig", action),
                 R.kv("hit", "yes" if _strategy_hit(action) else "no"),
             ]
