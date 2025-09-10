@@ -96,6 +96,11 @@ class BrokerBase:
         """Return {'t': iso_ts, 'p': price, 's': size} for the most recent trade."""
         raise NotImplementedError
 
+    # NEW: most recent quote (bid/ask)
+    def get_latest_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Return {'t': iso_ts, 'bp': bid_price, 'ap': ask_price} for the most recent quote."""
+        raise NotImplementedError
+
     # NEW: historical backfill
     def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
         """Return up to `limit` most recent CLOSED bars, oldest→newest. Each bar is {t,o,h,l,c,v} with t as ISO8601."""
@@ -127,6 +132,10 @@ class LocalPaperBroker(BrokerBase):
 
     def get_position(self, symbol: str) -> Optional[Position]:
         return self._positions.get(symbol)
+
+    def get_latest_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        # Local broker does not simulate a live order book
+        return None
 
     def _tf_seconds(self, timeframe: str) -> int:
         u = timeframe.strip().lower()
@@ -316,6 +325,30 @@ class AlpacaBroker(BrokerBase):
             req = StockLatestTradeRequest(symbol_or_symbols=sym)
             tr = self.stock_data.get_stock_latest_trade(req)[sym]
         return {"t": tr.timestamp.isoformat(), "p": float(tr.price), "s": float(getattr(tr, "size", 0) or 0)}
+
+    def get_latest_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        # Return the most recent quote (bid/ask). For crypto this often updates more frequently
+        # than trades; we use it for a better live display match with Alpaca UI mid price.
+        if _is_crypto_symbol(symbol):
+            from alpaca.data.requests import CryptoLatestQuoteRequest
+            sym = _to_alpaca_crypto_data_symbol(symbol)
+            req = CryptoLatestQuoteRequest(symbol_or_symbols=sym)
+            qt = self.crypto_data.get_crypto_latest_quote(req)[sym]
+            return {
+                't': qt.timestamp.isoformat(),
+                'bp': float(getattr(qt, 'bid_price', 0.0) or 0.0),
+                'ap': float(getattr(qt, 'ask_price', 0.0) or 0.0),
+            }
+        else:
+            from alpaca.data.requests import StockLatestQuoteRequest
+            sym = _normalize_symbol(symbol)
+            req = StockLatestQuoteRequest(symbol_or_symbols=sym)
+            qt = self.stock_data.get_stock_latest_quote(req)[sym]
+            return {
+                't': qt.timestamp.isoformat(),
+                'bp': float(getattr(qt, 'bid_price', 0.0) or 0.0),
+                'ap': float(getattr(qt, 'ask_price', 0.0) or 0.0),
+            }
 
     def get_recent_bars(self, symbol: str, timeframe: str, limit: int) -> List[Dict[str, Any]]:
         # Fetch most recent CLOSED bars, oldest→newest
