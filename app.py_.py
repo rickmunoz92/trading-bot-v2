@@ -364,45 +364,44 @@ def main() -> None:
         return max(2.0, min(6.0, cfg.poll * 0.6))
     # DISPLAY price: live quote mid (crypto) or latest trade; fallback to bar close
     def price_fetch(allow_quote: bool = False) -> Tuple[Optional[float], str]:
+        """Best-effort live price with throttled quote usage.
+        Prefer latest trade for stability; optionally use quote mid for crypto when allowed.
+        Returns (price, src).
         """
-        QUOTE-only live price (midpoint) with safe fallback to latest CLOSED bar.
-        - Always attempts get_latest_quote() and returns mid = (bp + ap) / 2 with src='quote'
-        - If quote is unavailable, falls back to latest CLOSED bar close with src='bar'
-        - 'allow_quote' is ignored; kept for compatibility with callers
-        """
-        # Try QUOTE (preferred, every poll)
+        src = 'trade'
+        # Throttled latest quote (crypto only)
+        if allow_quote:
+            try:
+                if hasattr(broker, 'get_latest_quote') and broker.asset_class(cfg.symbol) == 'crypto':
+                    qt = _retry_broker(
+                        stop_event, responsive_sleep, 'get_latest_quote',
+                        broker.get_latest_quote, cfg.symbol,
+                        tries=3, base=0.5, cap=2.0, timeout=3.0,
+                        max_total_seconds=_market_call_budget()
+                    )
+                    if qt:
+                        bp = float(qt.get('bp', 0.0) or 0.0)
+                        ap = float(qt.get('ap', 0.0) or 0.0)
+                        if bp > 0 and ap > 0:
+                            return ((bp + ap) / 2.0, 'quote')
+            except Exception:
+                pass
+        # Latest trade (all assets)
         try:
-            if hasattr(broker, 'get_latest_quote'):
-                qt = _retry_broker(
-                    stop_event, responsive_sleep, 'get_latest_quote',
-                    broker.get_latest_quote, cfg.symbol,
-                    tries=3, base=0.5, cap=2.0, timeout=3.0,
-                    max_total_seconds=_market_call_budget()
-                )
-                if qt:
-                    bp = float(qt.get('bp', 0.0) or 0.0)
-                    ap = float(qt.get('ap', 0.0) or 0.0)
-                    if bp > 0 and ap > 0 and ap >= bp:
-                        return ((bp + ap) / 2.0, 'quote')
-        except Exception:
-            # fall through to bar fallback
-            pass
-
-        # Fallback: latest CLOSED bar
-        try:
-            latest_bars = _retry_broker(
-                stop_event, responsive_sleep, "get_recent_bars",
-                broker.get_recent_bars, cfg.symbol, cfg.timeframe, 1,
-                tries=2, base=0.25, cap=1.0, timeout=2.0,
+            tr = _retry_broker(
+                stop_event, responsive_sleep, 'get_latest_trade',
+                broker.get_latest_trade, cfg.symbol,
+                tries=3, base=0.5, cap=2.0, timeout=3.0,
                 max_total_seconds=_market_call_budget()
             )
-            if latest_bars:
-                return (float(latest_bars[-1].get('c', 0.0) or 0.0), 'bar')
+            if tr:
+                p = tr.get('p', None)
+                if p is not None:
+                    return (float(p), 'trade')
         except Exception:
-            pass
+            return (None, src)
+        return (None, src)
 
-        # If everything fails, indicate quote source but no price
-        return (None, 'quote')
 
     def get_position_safe() -> Optional[Dict[str, Any]]:
         try:
