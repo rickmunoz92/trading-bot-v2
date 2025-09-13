@@ -331,8 +331,7 @@ def main() -> None:
 
     # Dynamic default for --side
     if cfg.side is None:
-        asset_cls = broker.asset_class(cfg.symbol)
-        cfg.side = "long" if asset_cls == "crypto" else "both"
+        cfg.side = "both"
 
     # Graceful, responsive shutdown
     stop_event = threading.Event()
@@ -513,7 +512,7 @@ def main() -> None:
         side = _infer_side_from_position(pos)
         tp = avg * (1 + cfg.tp_pct / 100.0) if side == "long" else avg * (1 - cfg.tp_pct / 100.0)
         sl = avg * (1 - cfg.sl_pct / 100.0) if side == "long" else avg * (1 + cfg.sl_pct / 100.0)
-        price, _src = price_fetch(allow_quote=allow_quote)
+        price, _src = price_fetch()
         if price is None:
             return pos
         hit = _breach_for_side(side, price, tp, sl)
@@ -545,7 +544,7 @@ def main() -> None:
         avg = float(getattr(open_position, 'avg_price', 0.0))
         if avg <= 0:
             return open_position
-        price, _src = price_fetch(allow_quote=allow_quote)
+        price, _src = price_fetch()
         if price is None:
             return open_position
         side = _infer_side_from_position(open_position)
@@ -576,6 +575,17 @@ def main() -> None:
 
     # --- Startup reconcile
     open_position = _reconcile_on_start(cfg, broker, journal)
+
+    # Sync strategy position-direction with broker on startup
+    try:
+        if open_position is None:
+            strategy.set_position_dir(0)
+        else:
+            _q0 = float(getattr(open_position, "qty", 0.0))
+            strategy.set_position_dir(+1 if _q0 > 0 else -1)
+    except Exception:
+        pass
+
 
     loop_counter = 0
     try:
@@ -636,7 +646,7 @@ def main() -> None:
             action = "hold"
 
             # DISPLAY price uses live quote mid (crypto) or latest trade; fallback to bar close
-            display_price, price_src = price_fetch(allow_quote=allow_quote)
+            display_price, price_src = price_fetch()
             try:
                 strategy.ingest_live(float(display_price))
             except Exception:
@@ -667,6 +677,7 @@ def main() -> None:
             except Exception as e:
                 print(R.warn(f"position re-sync failed: {e}"))
             # ------------------------------------------------------------------------------
+
 
             # ---------- Enforce TP/SL before strategy ----------
             if open_position:
