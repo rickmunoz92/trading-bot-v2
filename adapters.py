@@ -196,7 +196,7 @@ class LocalPaperBroker(BrokerBase):
         pnl_pct = (exit_price - pos.avg_price) / pos.avg_price * side * 100.0
         return pnl_abs, pnl_pct
 
-# -------- Alpaca Broker (minimal) --------
+# -------- Alpaca Broker (with IEX default feed for equities) --------
 class AlpacaBroker(BrokerBase):
     name = "alpaca"
 
@@ -204,6 +204,7 @@ class AlpacaBroker(BrokerBase):
         try:
             from alpaca.trading.client import TradingClient
             from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+            from alpaca.data.enums import DataFeed
         except Exception as e:
             raise RuntimeError(f"alpaca-py not installed or import failed: {e}")
 
@@ -217,7 +218,11 @@ class AlpacaBroker(BrokerBase):
         self.stock_data = StockHistoricalDataClient(api_key, secret)
         self.crypto_data = CryptoHistoricalDataClient(api_key, secret)
 
-    
+        # Choose stock feed: default to IEX to avoid SIP subscription errors,
+        # allow override via ALPACA_STOCK_FEED in {"IEX","SIP"}.
+        feed_env = (os.getenv("ALPACA_STOCK_FEED") or "IEX").strip().upper()
+        self.stock_feed = DataFeed.SIP if feed_env == "SIP" else DataFeed.IEX
+
     def get_bars_range(self, symbol: str, timeframe: str, start_iso: str, end_iso: str, max_bars: int = 2000, chunk: int = 500) -> List[Dict[str, Any]]:
         """Fetch CLOSED bars between [start_iso, end_iso], chunking requests to avoid short-window/limit issues.
         Returns oldest→newest bars (up to max_bars)."""
@@ -234,7 +239,7 @@ class AlpacaBroker(BrokerBase):
             else:
                 from alpaca.data.requests import StockBarsRequest
                 sym = _normalize_symbol(symbol)
-                req = StockBarsRequest(symbol_or_symbols=sym, timeframe=tf, start=start_iso, end=current_end, limit=want)
+                req = StockBarsRequest(symbol_or_symbols=sym, timeframe=tf, start=start_iso, end=current_end, limit=want, feed=self.stock_feed)
                 out = self.stock_data.get_stock_bars(req).data.get(sym, [])
             chunk_bars: List[Dict[str, Any]] = []
             for b in out:
@@ -262,6 +267,7 @@ class AlpacaBroker(BrokerBase):
         # Final chronological order oldest→newest
         bars.sort(key=lambda x: x["t"])
         return bars
+
     def min_lot(self, symbol: str) -> float:
         return 1.0 if self.asset_class(symbol) == "equity" else 0.0001
 
@@ -301,7 +307,7 @@ class AlpacaBroker(BrokerBase):
             bar = self.crypto_data.get_crypto_latest_bar(req)[symbol_api]
         else:
             sym = _normalize_symbol(symbol)  # e.g., AAPL
-            req = StockLatestBarRequest(symbol_or_symbols=sym)
+            req = StockLatestBarRequest(symbol_or_symbols=sym, feed=self.stock_feed)
             bar = self.stock_data.get_stock_latest_bar(req)[sym]
         return {
             "t": bar.timestamp.isoformat(),
@@ -322,7 +328,7 @@ class AlpacaBroker(BrokerBase):
         else:
             from alpaca.data.requests import StockLatestTradeRequest
             sym = _normalize_symbol(symbol)              # e.g., AAPL
-            req = StockLatestTradeRequest(symbol_or_symbols=sym)
+            req = StockLatestTradeRequest(symbol_or_symbols=sym, feed=self.stock_feed)
             tr = self.stock_data.get_stock_latest_trade(req)[sym]
         return {"t": tr.timestamp.isoformat(), "p": float(tr.price), "s": float(getattr(tr, "size", 0) or 0)}
 
@@ -342,7 +348,7 @@ class AlpacaBroker(BrokerBase):
         else:
             from alpaca.data.requests import StockLatestQuoteRequest
             sym = _normalize_symbol(symbol)
-            req = StockLatestQuoteRequest(symbol_or_symbols=sym)
+            req = StockLatestQuoteRequest(symbol_or_symbols=sym, feed=self.stock_feed)
             qt = self.stock_data.get_stock_latest_quote(req)[sym]
             return {
                 't': qt.timestamp.isoformat(),
@@ -361,7 +367,7 @@ class AlpacaBroker(BrokerBase):
         else:
             from alpaca.data.requests import StockBarsRequest
             sym = _normalize_symbol(symbol)
-            req = StockBarsRequest(symbol_or_symbols=sym, timeframe=tf, limit=limit)
+            req = StockBarsRequest(symbol_or_symbols=sym, timeframe=tf, limit=limit, feed=self.stock_feed)
             out = self.stock_data.get_stock_bars(req).data.get(sym, [])
         bars: List[Dict[str, Any]] = []
         for b in out:
