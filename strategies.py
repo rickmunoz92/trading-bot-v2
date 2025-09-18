@@ -116,6 +116,31 @@ class EmaCross(StrategyBase):
         self.prev_rel = rel_now
         return {"action": "hold"}
 
+    
+
+    def recalc_from_bars(self, bars: List[Dict[str, Any]]) -> None:
+        """
+        Rebuild EMA state from CLOSED bars (oldest→newest). Preserves pos_dir/prev_rel.
+        """
+        # Preserve directional state
+        pos_dir = self.pos_dir
+        prev_rel = self.prev_rel
+        # Reset EMA state
+        self.prices.clear()
+        self.ema_fast = None
+        self.ema_slow = None
+        self.live_ema_fast = None
+        self.live_ema_slow = None
+        # Ingest bars to rebuild
+        for b in bars:
+            try:
+                self.ingest(b)
+            except Exception:
+                # Skip malformed bars
+                continue
+        # Restore directional state
+        self.pos_dir = pos_dir
+        self.prev_rel = prev_rel
     def debug_state(self) -> Dict[str, Any]:
         """
         Report CLOSED-bar EMAs in primary fields (to match TradingView/Alpaca),

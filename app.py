@@ -625,7 +625,7 @@ def main() -> None:
                     tries=3, base=0.5, cap=2.0, timeout=3.0,
                     max_total_seconds=_market_call_budget()
                 )
-                bar_now = latest_bars[0] if latest_bars else None
+                bar_now = latest_bars[-1] if latest_bars else None
             except Exception as e:
                 msg = str(e)
                 if '429' in msg or 'Too Many Requests' in msg:
@@ -694,7 +694,7 @@ def main() -> None:
                     header_line = f"{human_ts(now_utc_iso())} " + format_header(
                         cfg, broker, current_price=display_price, action=action,
                         strategy_state=getattr(strategy, "debug_state", lambda: {})()
-                    )
+                        )
                     line = [
                         R.kv("price", f"{display_price:.4f}"),
                 R.kv("src", price_src),
@@ -747,6 +747,7 @@ def main() -> None:
                 except Exception:
                     pass
                 prev_bar = bar_now
+            
             else:
                 # Always ingest when the CLOSED bar timestamp changes (don’t rely on bucket math)
                 try:
@@ -754,24 +755,59 @@ def main() -> None:
                 except Exception:
                     _t_now = None
 
-                if (_t_now is None) or (_t_now != last_ingested_t):
+                                # ALWAYS perform a full EMA recalculation each poll using CLOSED bars.
+                try:
+                    hist_limit = max(cfg.slow * 5, cfg.slow + 10)
+                    from datetime import timedelta
+                    tf_secs = _parse_timeframe_seconds(cfg.timeframe)
+                    end_dt = datetime.now(timezone.utc)
+                    start_dt = end_dt - timedelta(seconds=hist_limit * tf_secs)
+
+                    # Fetch a time-bounded window first; fall back to limit-only
+                    if hasattr(broker, "get_bars_range"):
+                        bars = _retry_broker(
+                            stop_event, responsive_sleep, "get_bars_range",
+                            getattr(broker, "get_bars_range"),
+                            cfg.symbol, cfg.timeframe,
+                            start_dt.isoformat(), end_dt.isoformat(),
+                            hist_limit, 500,
+                            tries=2, base=0.25, cap=1.0, timeout=4.0,
+                            max_total_seconds=_market_call_budget()
+                        ) or []
+                    else:
+                        bars = []
+
+                    if not bars:
+                        bars = _retry_broker(
+                            stop_event, responsive_sleep, "get_recent_bars",
+                            broker.get_recent_bars, cfg.symbol, cfg.timeframe, hist_limit,
+                            tries=3, base=0.5, cap=2.0, timeout=3.0,
+                            max_total_seconds=_market_call_budget()
+                        ) or []
+
+                    if bars:
+                        strategy.recalc_from_bars(bars)
+                        # Stale-bar diagnostic
+                        try:
+                            _last_bar_t = bars[-1].get("t")
+                            if 'last_ingested_t' in locals() and _last_bar_t is not None and last_ingested_t == _last_bar_t:
+                                print(R.warn("recalc stale: last closed bar unchanged"))
+                            last_ingested_t = _last_bar_t
+                        except Exception:
+                            pass
+                    else:
+                        # No bars returned (rare). Ingest the current CLOSED bar as a fallback.
+                        strategy.ingest(bar_now)
+                        last_ingested_t = bar_now.get("t")
+                except Exception as exc:
+                    print(R.warn("EMA recalc failed: " + str(exc) + " — falling back to single-bar ingest"))
                     strategy.ingest(bar_now)
-                    last_ingested_t = _t_now
-
-                    # After ingest, evaluate signal and apply side gating
-                    signal_out = strategy.signal()
-                    action = signal_out.get("action", "hold")
-                    action = _apply_side_filter(action, cfg.side)
-
-                # Keep bucket bookkeeping for display/logging, but it no longer gates ingestion
-                last_bucket_sec = bucket_now
-                prev_bar = bar_now
-            # --- Header (includes EMA values when available) ---
+                    last_ingested_t = bar_now.get("t")
             header_line = f"{human_ts(now_utc_iso())} " + format_header(
                 cfg, broker, current_price=display_price, action=action,
                 strategy_state=getattr(strategy, "debug_state", lambda: {})()
             )
-
+            
             # --- Status line ---
             line = [
                 R.kv("price", f"{display_price:.4f}"),
@@ -831,10 +867,9 @@ def main() -> None:
                 journal.on_entry(
                     when=now_utc_iso(),
                     entry_price=entry,
-                    qty=qty,
                     tp=plan.take_profit,
                     sl=plan.stop_loss,
-                    meta={"order_id": order_id, "strategy": cfg.strategy_name}
+                    meta={"order_id": order_id, "strategy": cfg.strategy_name, "qty": qty}
                 )
                 # refresh cached position after submit
                 open_position = get_position_safe()
