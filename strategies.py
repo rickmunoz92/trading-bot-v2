@@ -120,10 +120,17 @@ class EmaCross(StrategyBase):
         # Prefer live preview if available
         ef = self.live_ema_fast if self.live_ema_fast is not None else self.ema_fast
         es = self.live_ema_slow if self.live_ema_slow is not None else self.ema_slow
+        # current relation sign if both EMAs exist
+        try:
+            rel_now = self._sign((ef or 0.0) - (es or 0.0)) if (ef is not None and es is not None) else None
+        except Exception:
+            rel_now = None
         return {
             "ema_fast": ef,
             "ema_slow": es,
             "pos_dir": self.pos_dir,
+            "prev_rel": self.prev_rel,
+            "rel_now": rel_now,
             "ready": (self.ema_fast is not None and self.ema_slow is not None),
             "bars_seen": len(self.prices),
             "bars_until_ready": max(0, self.slow - len(self.prices)) if self.ema_slow is None else 0,
