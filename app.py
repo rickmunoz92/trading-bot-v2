@@ -586,6 +586,13 @@ def main() -> None:
     except Exception:
         pass
 
+    # Seed prev_rel/initial state post-reconcile so first bar can trigger entries/exits
+    try:
+        _ = strategy.signal()
+    except Exception:
+        pass
+
+
 
     loop_counter = 0
     try:
