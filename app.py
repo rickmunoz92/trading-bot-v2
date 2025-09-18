@@ -706,7 +706,8 @@ def main() -> None:
                     continue
             # -----------------------------------------------------------------
 
-            # Bar gating for strategy updates
+
+            # Bar gating for strategy updates  ⟶  TIMESTAMP-DRIVEN INGEST (robust on 1m)
             if last_bucket_sec is None:
                 last_bucket_sec = bucket_now
                 # Ensure EMAs are ready on first poll: if not, feed the most recent CLOSED bar once.
@@ -715,6 +716,7 @@ def main() -> None:
                     _ready = bool(_ds.get("ready"))
                 except Exception:
                     _ready = False
+
                 try:
                     if not _ready:
                         try:
@@ -729,6 +731,7 @@ def main() -> None:
                             _latest_closed = []
                         _bar_seed = _latest_closed[-1] if _latest_closed else bar_now
                         _t_seed = _bar_seed.get("t")
+
                         # Only ingest if we didn't already ingest this exact bar during backfill
                         _should_ingest = True
                         if last_backfill_t is not None:
@@ -736,6 +739,7 @@ def main() -> None:
                                 _should_ingest = (_t_seed != last_backfill_t)
                             except Exception:
                                 _should_ingest = True
+
                         if _should_ingest and (_t_seed != last_ingested_t):
                             strategy.ingest(_bar_seed)
                             last_ingested_t = _t_seed
@@ -744,25 +748,24 @@ def main() -> None:
                     pass
                 prev_bar = bar_now
             else:
-                if bucket_now == last_bucket_sec:
-                    prev_bar = bar_now
-                else:
-                    # A new timeframe bucket started => the previous bar just CLOSED.
-                    # Ingest the freshly closed bar (bar_now) so EMAs update on time.
-                    try:
-                        _t_now = bar_now.get("t")
-                    except Exception:
-                        _t_now = None
-                    if (_t_now is None) or (_t_now != last_ingested_t):
-                        strategy.ingest(bar_now)
-                        last_ingested_t = _t_now
+                # Always ingest when the CLOSED bar timestamp changes (don’t rely on bucket math)
+                try:
+                    _t_now = bar_now.get("t")
+                except Exception:
+                    _t_now = None
+
+                if (_t_now is None) or (_t_now != last_ingested_t):
+                    strategy.ingest(bar_now)
+                    last_ingested_t = _t_now
+
+                    # After ingest, evaluate signal and apply side gating
                     signal_out = strategy.signal()
                     action = signal_out.get("action", "hold")
                     action = _apply_side_filter(action, cfg.side)
-                    last_bucket_sec = bucket_now
-                # Track the latest closed bar for reference
-                prev_bar = bar_now
 
+                # Keep bucket bookkeeping for display/logging, but it no longer gates ingestion
+                last_bucket_sec = bucket_now
+                prev_bar = bar_now
             # --- Header (includes EMA values when available) ---
             header_line = f"{human_ts(now_utc_iso())} " + format_header(
                 cfg, broker, current_price=display_price, action=action,
