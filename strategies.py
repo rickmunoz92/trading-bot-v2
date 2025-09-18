@@ -117,17 +117,23 @@ class EmaCross(StrategyBase):
         return {"action": "hold"}
 
     def debug_state(self) -> Dict[str, Any]:
-        # Prefer live preview if available
-        ef = self.live_ema_fast if self.live_ema_fast is not None else self.ema_fast
-        es = self.live_ema_slow if self.live_ema_slow is not None else self.ema_slow
-        # current relation sign if both EMAs exist
+        """
+        Report CLOSED-bar EMAs in primary fields (to match TradingView/Alpaca),
+        and expose intrabar live previews separately.
+        """
+        ef_closed = self.ema_fast
+        es_closed = self.ema_slow
+        ef_live = self.live_ema_fast
+        es_live = self.live_ema_slow
         try:
-            rel_now = self._sign((ef or 0.0) - (es or 0.0)) if (ef is not None and es is not None) else None
+            rel_now = self._sign((ef_closed or 0.0) - (es_closed or 0.0)) if (ef_closed is not None and es_closed is not None) else None
         except Exception:
             rel_now = None
         return {
-            "ema_fast": ef,
-            "ema_slow": es,
+            "ema_fast": ef_closed,
+            "ema_slow": es_closed,
+            "ema_fast_live": ef_live,
+            "ema_slow_live": es_live,
             "pos_dir": self.pos_dir,
             "prev_rel": self.prev_rel,
             "rel_now": rel_now,
