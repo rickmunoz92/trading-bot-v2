@@ -815,12 +815,6 @@ def main() -> None:
                 R.kv("sig", action),
                 R.kv("hit", "yes" if _strategy_hit(action) else "no"),
             ]
-            if open_position:
-                try:
-                    line.append(R.kv("pos_avg", f"{float(getattr(open_position, 'avg_price', 0.0)):.4f}"))
-                    line.append(R.kv("pos_qty", f"{getattr(open_position, 'qty', 0)}"))
-                except Exception:
-                    pass
             print(f"{header_line} | " + " ".join(line))
 
             # --- Execute (budgeted retry) ---
