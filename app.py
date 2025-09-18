@@ -803,6 +803,8 @@ def main() -> None:
                     print(R.warn("EMA recalc failed: " + str(exc) + " — falling back to single-bar ingest"))
                     strategy.ingest(bar_now)
                     last_ingested_t = bar_now.get("t")
+            sig_obj = strategy.signal()
+            action = _apply_side_filter(sig_obj.get("action", "hold"), cfg.side or "both")
             header_line = f"{human_ts(now_utc_iso())} " + format_header(
                 cfg, broker, current_price=display_price, action=action,
                 strategy_state=getattr(strategy, "debug_state", lambda: {})()
