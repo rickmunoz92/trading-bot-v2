@@ -863,8 +863,8 @@ def main() -> None:
                 journal.on_entry(
                     when=now_utc_iso(),
                     entry_price=entry,
-                    tp=plan.take_profit,
-                    sl=plan.stop_loss,
+                    take_profit=plan.take_profit,
+                    stop_loss=plan.stop_loss,
                     meta={"order_id": order_id, "strategy": cfg.strategy_name, "qty": qty}
                 )
                 # refresh cached position after submit
