@@ -1,1 +1,2 @@
-Entry Date,Entry Time,Exit Date,Exit Time,Symbol,Asset Class,Strategy/Setup,Entry Price,Stop Loss,Take Profit,Exit Price,Position Size,Result (Win/Loss),PnL ($),PnL (%),Notes
+Entry Date,Entry Time,Exit Date,Exit Time,Symbol,Asset Class,Strategy/Setup,Entry Price,Stop Loss,Take Profit,Exit Price,Position Size,Result (Win/Loss),PnL ($),PnL (%),Notes"Mon Sep 22, 2025",10:27:25 AM,"Mon Sep 22, 2025",10:56:01 AM,BTCUSD,crypto,EMA Cross (9=112852.7544 / 21=112850.7632),0.0353,112894.5000,113458.9725,112686.0385,112612.2638,Loss,-10.39,-0.26,
+"Mon Sep 22, 2025",11:27:34 AM,"Mon Sep 22, 2025",01:37:29 PM,BTCUSD,crypto,EMA Cross (9=112505.1647 / 21=112503.4658),0.0354,112541.4855,113104.1929,112237.7625,112260.1318,Loss,-12.23,-0.31,

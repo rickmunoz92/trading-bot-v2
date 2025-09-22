@@ -229,7 +229,20 @@ class AlpacaBroker(BrokerBase):
         tf = self._to_alpaca_tf(timeframe)
         bars: List[Dict[str, Any]] = []
         current_end = end_iso
+        # Guard: if current_end drifts before start_iso, stop to avoid API errors
+        from datetime import datetime as _dt, timezone as _tz
+        try:
+            _start_dt = _dt.fromisoformat(start_iso.replace('Z','+00:00'))
+        except Exception:
+            _start_dt = None
         while len(bars) < max_bars:
+            if _start_dt is not None:
+                try:
+                    _end_dt = _dt.fromisoformat(current_end.replace('Z','+00:00'))
+                    if _end_dt <= _start_dt:
+                        break
+                except Exception:
+                    pass
             want = min(chunk, max_bars - len(bars))
             if _is_crypto_symbol(symbol):
                 from alpaca.data.requests import CryptoBarsRequest

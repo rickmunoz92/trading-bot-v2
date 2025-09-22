@@ -34,5 +34,41 @@
     "PnL ($)": "0.00",
     "PnL (%)": "0.00",
     "Notes": "{\"order_id\": \"182251ae-6d7f-461c-ac8c-9f2502e6dced\"}"
+  },
+  {
+    "Entry Date": "Mon Sep 22, 2025",
+    "Entry Time": "10:27:25 AM",
+    "Exit Date": "Mon Sep 22, 2025",
+    "Exit Time": "10:56:01 AM",
+    "Symbol": "BTCUSD",
+    "Asset Class": "crypto",
+    "Strategy/Setup": "EMA Cross (9=112852.7544 / 21=112850.7632)",
+    "Entry Price": "0.0353",
+    "Stop Loss": "112894.5000",
+    "Take Profit": "113458.9725",
+    "Exit Price": "112686.0385",
+    "Position Size": "112612.2638",
+    "Result (Win/Loss)": "Loss",
+    "PnL ($)": "-10.39",
+    "PnL (%)": "-0.26",
+    "Notes": ""
+  },
+  {
+    "Entry Date": "Mon Sep 22, 2025",
+    "Entry Time": "11:27:34 AM",
+    "Exit Date": "Mon Sep 22, 2025",
+    "Exit Time": "01:37:29 PM",
+    "Symbol": "BTCUSD",
+    "Asset Class": "crypto",
+    "Strategy/Setup": "EMA Cross (9=112505.1647 / 21=112503.4658)",
+    "Entry Price": "0.0354",
+    "Stop Loss": "112541.4855",
+    "Take Profit": "113104.1929",
+    "Exit Price": "112237.7625",
+    "Position Size": "112260.1318",
+    "Result (Win/Loss)": "Loss",
+    "PnL ($)": "-12.23",
+    "PnL (%)": "-0.31",
+    "Notes": ""
   }
 ]
