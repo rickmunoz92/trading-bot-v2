@@ -952,7 +952,8 @@ def main() -> None:
                 # refresh cached position after submit
                 open_position = get_position_safe()
 
-                print(f"{human_ts(now_utc_iso())} " + R.good(f"entered {side.upper()} {cfg.symbol} @ {entry:.4f} qty={qty} tp={plan.take_profit:.4f} sl={plan.stop_loss:.4f} (order_id={order_id})"))
+                _notional = qty * entry
+                print(f"{human_ts(now_utc_iso())} " + R.good(f"entered {side.upper()} {cfg.symbol} @ {entry:.4f} qty={qty} tp={plan.take_profit:.4f} sl={plan.stop_loss:.4f} notional=${_notional:.2f} (order_id={order_id})"))
 
             # If we had an entry signal but were blocked by an existing position, emit a diagnostic once.
             elif action in ("enter_long", "enter_short") and not _can_enter:
