@@ -484,7 +484,26 @@ def main() -> None:
 
             try:
                 _ds0 = getattr(strategy, "debug_state", lambda: {})()
-                print(R.dim(f"Backfill fetched {len(bars)} bars (attempt {attempts}, window={lookback_bars}); ready={_ds0.get('ready')} bars_until_ready={_ds0.get('bars_until_ready')}"))
+                # Estimated notional if a trade were taken right now (risk-based sizing):
+                try:
+                    _entry = float(bars[-1].get('c', 0.0)) if bars else 0.0
+                except Exception:
+                    _entry = 0.0
+                try:
+                    _disp_eq = broker.get_equity() if getattr(broker, "name", "").lower() != "local" else cfg.equity
+                except Exception:
+                    _disp_eq = cfg.equity
+                try:
+                    _lot = broker.min_lot(cfg.symbol)
+                except Exception:
+                    _lot = 1.0
+                try:
+                    _tmp = plan_bracket('buy', _entry, cfg.tp_pct, cfg.sl_pct, qty=0, meta={})
+                    _qty = risk_size_qty(equity=_disp_eq, risk_pct=cfg.risk_pct, entry=_entry, stop=_tmp.stop_loss, lot_size=_lot)
+                    _est_notional = _qty * _entry
+                except Exception:
+                    _est_notional = 0.0
+                print(R.dim(f"Backfill fetched {len(bars)} bars (attempt {attempts}, window={lookback_bars}); ready={_ds0.get('ready')} bars_until_ready={_ds0.get('bars_until_ready')} est_notional=${_est_notional:.2f}"))
             except Exception:
                 pass
 
