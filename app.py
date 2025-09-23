@@ -907,18 +907,6 @@ def main() -> None:
                 )
                 try:
                     journal.on_entry(
-                        now_utc_iso(),
-                        cfg.symbol,
-                        _asset_cls,
-                        _strategy_label,
-                        qty,
-                        entry,
-                        plan.take_profit,
-                        plan.stop_loss
-                    )
-                except TypeError:
-                    # Backward-compatibility for older Journal signatures
-                    journal.on_entry(
                         when=now_utc_iso(),
                         symbol=cfg.symbol,
                         asset_class=_asset_cls,
@@ -928,6 +916,19 @@ def main() -> None:
                         take_profit=plan.take_profit,
                         stop_loss=plan.stop_loss
                     )
+                except TypeError:
+                    # Legacy Journal without kwargs support: fall back to positional order
+                    journal.on_entry(
+                        now_utc_iso(),
+                        cfg.symbol,
+                        _asset_cls,
+                        _strategy_label,
+                        qty,
+                        entry,
+                        plan.take_profit,
+                        plan.stop_loss
+                    )
+
 
                 # refresh cached position after submit
                 open_position = get_position_safe()
@@ -959,9 +960,14 @@ def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, 
         R.kv("broker", broker.name.upper()),
         R.kv("strategy", format_strategy_label(cfg.strategy_name, cfg.fast, cfg.slow, strategy_state)),
         R.kv("side", (cfg.side or '').upper() or 'AUTO'),
-        R.kv("Risk", f"${cfg.equity * (cfg.risk_pct/100.0):.2f} ({cfg.risk_pct:.2f}%)"),
-        R.kv("poll", f"{cfg.poll}s"),
     ]
+    # Display risk using live broker equity when available (avoids misleading display on non-local brokers)
+    try:
+        disp_eq = broker.get_equity() if getattr(broker, "name", "").lower() != "local" else cfg.equity
+    except Exception:
+        disp_eq = cfg.equity
+    kv.append(R.kv("Risk", f"${disp_eq * (cfg.risk_pct/100.0):.2f} ({cfg.risk_pct:.3f}%)"))
+    kv.append(R.kv("poll", f"{cfg.poll}s"))
     if current_price is not None:
         if action in ("enter_long", "enter_short"):
             _side = "buy" if action == "enter_long" else "sell"
@@ -971,7 +977,6 @@ def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, 
         kv.append(R.kv("TP", f"${_plan.take_profit:.2f} ({cfg.tp_pct:.2f}%)"))
         kv.append(R.kv("SL", f"${_plan.stop_loss:.2f} ({cfg.sl_pct:.2f}%)"))
     return "  ".join(kv)
-
 
 if __name__ == "__main__":
     main()
