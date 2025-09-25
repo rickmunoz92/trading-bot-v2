@@ -9,3 +9,7 @@ __pycache__/
 
 # Virtualenv
 .venv/
+.env.*
+*.env
+# macOS
+.DS_Store
