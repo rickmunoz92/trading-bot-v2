@@ -5,7 +5,7 @@ import signal
 import time
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import os
 try:
     from zoneinfo import ZoneInfo
@@ -23,7 +23,6 @@ from io_utils import R, Journal
 # Backward-compatibility: some io_utils versions don't define R.good
 if not hasattr(R, 'good'):
     try:
-        # Prefer a green/ok formatter if present; else identity
         R.good = getattr(R, 'ok')  # type: ignore[attr-defined]
     except Exception:
         R.good = lambda s: s  # type: ignore
@@ -69,7 +68,6 @@ def ensure_csv_headers(symbol: str) -> None:
         pass
 
 
-
 # ------------------------------- Data classes -------------------------------
 
 @dataclass
@@ -86,7 +84,8 @@ class Config:
     equity: float
     fast: int
     slow: int
-    side: Optional[str]  # "long" | "short" | "both" | None (None => dynamic default)
+    side: Optional[str]  # "long" | "short" | "both" | None
+
 
 @dataclass
 class OrderPlan:
@@ -128,6 +127,7 @@ def format_strategy_label(name: str, fast: int, slow: int, state: Optional[Dict[
     # Fallback
     return f"{label} ({fast}/{slow})"
 
+
 def human_ts(ts: str) -> str:
     try:
         dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
@@ -135,6 +135,7 @@ def human_ts(ts: str) -> str:
         return dt.strftime("%I:%M:%S %p %a %b %d, %Y")
     except Exception:
         return ts
+
 
 def fmt_mt(dt: datetime) -> str:
     dt_mt = dt.astimezone(MT)
@@ -204,8 +205,10 @@ def _safe_json(obj: Any) -> str:
                 return repr(o)
         return json.dumps(obj, default=_default)
 
+
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def plan_bracket(side: str, entry: float, tp_pct: float, sl_pct: float, qty: float, meta: Dict[str, Any]) -> OrderPlan:
     if side not in ("buy", "sell"):
@@ -219,6 +222,7 @@ def plan_bracket(side: str, entry: float, tp_pct: float, sl_pct: float, qty: flo
     return OrderPlan(side=side, qty=qty, entry=entry,
                      take_profit=round(take, 4), stop_loss=round(stop, 4), meta=meta)
 
+
 def risk_size_qty(equity: float, risk_pct: float, entry: float, stop: float, lot_size: float = 1.0) -> float:
     risk_dollars = equity * (risk_pct / 100.0)
     per_unit_risk = abs(entry - stop)
@@ -228,8 +232,10 @@ def risk_size_qty(equity: float, risk_pct: float, entry: float, stop: float, lot
     steps = int(qty / lot_size)
     return max(0.0, steps * lot_size)
 
+
 def _strategy_hit(action: Optional[str]) -> bool:
     return action in ("enter_long", "enter_short")
+
 
 def _apply_side_filter(action: str, side_pref: str) -> str:
     if side_pref == "long" and action == "enter_short":
@@ -237,6 +243,7 @@ def _apply_side_filter(action: str, side_pref: str) -> str:
     if side_pref == "short" and action == "enter_long":
         return "hold"
     return action
+
 
 _TF_RE = re.compile(r"^\s*(\d+)\s*([mhd])\s*$", re.IGNORECASE)
 
@@ -253,6 +260,7 @@ def _parse_timeframe_seconds(tf: str) -> int:
     if unit == "d":
         return n * 86400
     return 60
+
 
 def _iso_to_dt(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -273,6 +281,7 @@ def _infer_side_from_position(pos) -> str:
     except Exception:
         return "long"
 
+
 def _compute_tp_sl_for_side(avg_price: float, side: str, tp_pct: float, sl_pct: float) -> Tuple[float, float]:
     if side == "long":
         tp = avg_price * (1 + tp_pct / 100.0)
@@ -281,6 +290,7 @@ def _compute_tp_sl_for_side(avg_price: float, side: str, tp_pct: float, sl_pct: 
         tp = avg_price * (1 - tp_pct / 100.0)
         sl = avg_price * (1 + sl_pct / 100.0)
     return (tp, sl)
+
 
 def _breach_for_side(side: str, price: float, tp: float, sl: float) -> Optional[str]:
     if side == "long":
@@ -315,6 +325,7 @@ def _call_with_timeout(label: str, fn: Callable, args: tuple, kwargs: dict, time
             raise payload
     except Empty:
         raise TimeoutError(f"{label} timed out after {timeout:.1f}s")
+
 
 def _retry_broker(
     stop_event: threading.Event,
@@ -412,6 +423,7 @@ def main() -> None:
     def _market_call_budget() -> float:
         # Use up to 60% of poll interval for live data calls (never < 2s, never > 6s)
         return max(2.0, min(6.0, cfg.poll * 0.6))
+
     # DISPLAY price: live quote mid (crypto) or latest trade; fallback to bar close
     def price_fetch(allow_quote: bool = False) -> Tuple[Optional[float], str]:
         """
@@ -491,14 +503,12 @@ def main() -> None:
         tf_secs = _parse_timeframe_seconds(cfg.timeframe)
         # Initial lookback window: 5× slow period
         lookback_bars = max(cfg.slow * 5, cfg.slow + 10)
-        from datetime import timedelta
         end_dt = datetime.now(timezone.utc)
         start_dt = end_dt - timedelta(seconds=lookback_bars * tf_secs)
         attempts = 0
         max_limit = 8000  # hard cap on total bars
         while True:
             attempts += 1
-            # Use time-bounded range if broker supports it
             bars: List[Dict[str, Any]] = []
             if hasattr(broker, "get_bars_range"):
                 bars = _retry_broker(
@@ -563,13 +573,13 @@ def main() -> None:
             last_backfill_t = bars[-1]["t"] if bars else None
         except Exception:
             last_backfill_t = None
-        last_ingested_t = last_backfill_t
-
+        last_ingested_t: Optional[str] = last_backfill_t
+        last_ingested_wallclock = time.monotonic()  # when we last ingested a CLOSED bar
     except Exception as e:
         print(R.warn(f"Historical backfill unavailable: {e}"))
         last_backfill_t = None
         last_ingested_t = None
-# -----------------------------------------------------# -----------------------------------------------------# -----------------------------------------------------
+        last_ingested_wallclock = time.monotonic()
 
     # ---------- Reconciliation & enforcement ----------
     def _reconcile_on_start(cfg: Config, broker: BrokerBase, journal: Journal) -> Optional[Dict[str, Any]]:
@@ -678,16 +688,19 @@ def main() -> None:
     except Exception:
         pass
 
-
+    # --- Stuck detection state ---
+    same_t_count = 0
+    last_warn_ts: float = 0.0  # rate-limit stall warnings
 
     loop_counter = 0
     try:
         while not stop_event.is_set():
             loop_start = time.monotonic()
             loop_counter += 1
+
             # Throttle quote calls: once every ~5 loops (or ~10% of poll-derived cadence)
             quote_every = max(5, int(max(1, cfg.poll // 10)))
-            allow_quote = (loop_counter % quote_every == 0)
+            allow_quote = (loop_counter % quote_every == 0)  # retained for compatibility, not used
 
             # --- Trading window guard ---
             try:
@@ -703,11 +716,11 @@ def main() -> None:
                 pace_sleep(loop_start, cfg.poll)
                 continue
 
-            # --- Fetch market data (budgeted retry) ---
+            # --- Fetch market data (budgeted retry): pull 2 bars to avoid single-bar cache issues ---
             try:
                 latest_bars = _retry_broker(
                     stop_event, responsive_sleep, "get_recent_bars",
-                    broker.get_recent_bars, cfg.symbol, cfg.timeframe, 1,
+                    broker.get_recent_bars, cfg.symbol, cfg.timeframe, 2,
                     tries=3, base=0.5, cap=2.0, timeout=3.0,
                     max_total_seconds=_market_call_budget()
                 )
@@ -769,7 +782,7 @@ def main() -> None:
                         open_position = pos_now
             except Exception as e:
                 print(R.warn(f"position re-sync failed: {e}"))
-            # ------------------------------------------------------------------------------
+
             # --- Sync strategy position-direction with broker state (every loop) ---
             try:
                 if open_position is None:
@@ -779,8 +792,6 @@ def main() -> None:
                     strategy.set_position_dir(+1 if _q_sync > 0 else -1)
             except Exception:
                 pass
-
-
 
             # ---------- Enforce TP/SL before strategy ----------
             if open_position:
@@ -805,10 +816,8 @@ def main() -> None:
                     print(f"{header_line} | " + " ".join(line))
                     pace_sleep(loop_start, cfg.poll)
                     continue
-            # -----------------------------------------------------------------
 
-
-            # Bar gating for strategy updates  ⟶  TIMESTAMP-DRIVEN INGEST (robust on 1m)
+            # ---------- Closed-bar ingestion & stall watchdog ----------
             if last_bucket_sec is None:
                 last_bucket_sec = bucket_now
                 # Ensure EMAs are ready on first poll: if not, feed the most recent CLOSED bar once.
@@ -821,7 +830,6 @@ def main() -> None:
                 try:
                     if not _ready:
                         try:
-                            # Pull exactly one most recent CLOSED bar
                             _latest_closed = _retry_broker(
                                 stop_event, responsive_sleep, "get_recent_bars",
                                 broker.get_recent_bars, cfg.symbol, cfg.timeframe, 1,
@@ -833,7 +841,6 @@ def main() -> None:
                         _bar_seed = _latest_closed[-1] if _latest_closed else bar_now
                         _t_seed = _bar_seed.get("t")
 
-                        # Only ingest if we didn't already ingest this exact bar during backfill
                         _should_ingest = True
                         if last_backfill_t is not None:
                             try:
@@ -844,11 +851,12 @@ def main() -> None:
                         if _should_ingest and (_t_seed != last_ingested_t):
                             strategy.ingest(_bar_seed)
                             last_ingested_t = _t_seed
+                            last_ingested_wallclock = time.monotonic()
                             _ = strategy.signal()  # update strategy state after ingest
                 except Exception:
                     pass
                 prev_bar = bar_now
-            
+
             else:
                 # Always ingest when the CLOSED bar timestamp changes (don’t rely on bucket math)
                 try:
@@ -856,18 +864,15 @@ def main() -> None:
                 except Exception:
                     _t_now = None
 
-                                # ALWAYS perform a full EMA recalculation each poll using CLOSED bars.
-                # Recalculate only when the latest CLOSED bar timestamp changes; this avoids
-                # hammering the data API intrabar and prevents long stalls on retries.
                 if (_t_now is not None) and (_t_now != last_ingested_t):
+                    # New closed bar detected — recalc from a recent window (cheap & robust)
                     try:
                         hist_limit = max(cfg.slow * 5, cfg.slow + 10)
-                        from datetime import timedelta
                         tf_secs = _parse_timeframe_seconds(cfg.timeframe)
                         end_dt = datetime.now(timezone.utc)
                         start_dt = end_dt - timedelta(seconds=hist_limit * tf_secs)
 
-                        # Fetch a time-bounded window first; fall back to limit-only
+                        # Prefer time-bounded fetch
                         if hasattr(broker, 'get_bars_range'):
                             bars = _retry_broker(
                                 stop_event, responsive_sleep, 'get_bars_range',
@@ -891,32 +896,91 @@ def main() -> None:
 
                         if bars:
                             strategy.recalc_from_bars(bars)
-                            # Stale-bar diagnostic
                             try:
                                 _last_bar_t = bars[-1].get('t')
-                                if 'last_ingested_t' in locals() and _last_bar_t is not None and last_ingested_t == _last_bar_t:
+                                if _last_bar_t is not None and last_ingested_t == _last_bar_t:
                                     print(R.warn('recalc stale: last closed bar unchanged'))
                                 last_ingested_t = _last_bar_t
+                                last_ingested_wallclock = time.monotonic()
+                                same_t_count = 0
                             except Exception:
                                 pass
                         else:
                             # No bars returned (rare). Ingest the current CLOSED bar as a fallback.
                             strategy.ingest(bar_now)
                             last_ingested_t = bar_now.get('t')
+                            last_ingested_wallclock = time.monotonic()
+                            same_t_count = 0
                     except Exception as exc:
                         print(R.warn('EMA recalc failed: ' + str(exc) + ' — falling back to single-bar ingest'))
                         strategy.ingest(bar_now)
                         last_ingested_t = bar_now.get('t')
+                        last_ingested_wallclock = time.monotonic()
+                        same_t_count = 0
                 else:
-                    # No new CLOSED bar; skip heavy recalc. Live preview EMAs are still updated above.
-                    pass
+                    # No new CLOSED bar. Watchdog: if timestamp repeats too long, force a refresh.
+                    if _t_now is not None and last_ingested_t is not None and _t_now == last_ingested_t:
+                        same_t_count += 1
+                        # If we've seen the same closed-bar timestamp for >2× TF and multiple polls, force a window refresh.
+                        if (time.monotonic() - last_ingested_wallclock) > max(2 * tf_secs, cfg.poll * 3) and same_t_count >= 3:
+                            try:
+                                hist_limit = max(cfg.slow * 5, cfg.slow + 10)
+                                end_dt = datetime.now(timezone.utc)
+                                start_dt = end_dt - timedelta(seconds=hist_limit * tf_secs)
+                                bars = []
+                                if hasattr(broker, 'get_bars_range'):
+                                    bars = _retry_broker(
+                                        stop_event, responsive_sleep, 'get_bars_range',
+                                        getattr(broker, 'get_bars_range'),
+                                        cfg.symbol, cfg.timeframe,
+                                        start_dt.isoformat(), end_dt.isoformat(),
+                                        hist_limit, 500,
+                                        tries=2, base=0.25, cap=1.0, timeout=4.0,
+                                        max_total_seconds=_market_call_budget()
+                                    ) or []
+                                if not bars:
+                                    bars = _retry_broker(
+                                        stop_event, responsive_sleep, 'get_recent_bars',
+                                        broker.get_recent_bars, cfg.symbol, cfg.timeframe, hist_limit,
+                                        tries=3, base=0.5, cap=2.0, timeout=3.0,
+                                        max_total_seconds=_market_call_budget()
+                                    ) or []
+
+                                if bars:
+                                    strategy.recalc_from_bars(bars)
+                                    _last_bar_t = bars[-1].get('t')
+                                    if _last_bar_t != last_ingested_t:
+                                        last_ingested_t = _last_bar_t
+                                        last_ingested_wallclock = time.monotonic()
+                                        same_t_count = 0
+                                    else:
+                                        # Still stale. Warn (rate-limited).
+                                        now_mono = time.monotonic()
+                                        if now_mono - last_warn_ts > 60:
+                                            print(R.warn("Closed bar timestamp hasn’t advanced; waiting for provider to roll the bar..."))
+                                            last_warn_ts = now_mono
+                                else:
+                                    # No bars on refresh; warn once per minute.
+                                    now_mono = time.monotonic()
+                                    if now_mono - last_warn_ts > 60:
+                                        print(R.warn("Bar refresh returned empty set; will retry next poll."))
+                                        last_warn_ts = now_mono
+                            except Exception as exc:
+                                now_mono = time.monotonic()
+                                if now_mono - last_warn_ts > 60:
+                                    print(R.warn(f"Forced refresh failed: {exc}"))
+                                    last_warn_ts = now_mono
+                    else:
+                        same_t_count = 0  # timestamp progressed or was None
+
+            # ---------- Strategy signal & header ----------
             sig_obj = strategy.signal()
             action = _apply_side_filter(sig_obj.get("action", "hold"), cfg.side or "both")
             header_line = f"{human_ts(now_utc_iso())} " + format_header(
                 cfg, broker, current_price=display_price, action=action,
                 strategy_state=getattr(strategy, "debug_state", lambda: {})()
             )
-            
+
             # --- Status line ---
             line = [
                 R.kv("price", f"{display_price:.4f}"),
@@ -926,7 +990,7 @@ def main() -> None:
             ]
             print(f"{header_line} | " + " ".join(line))
 
-                        # --- Execute (budgeted retry) ---
+            # --- Execute (budgeted retry) ---
             # Treat tiny/zero-qty positions as flat (some brokers can briefly report qty=0)
             _can_enter = True
             if open_position is not None:
@@ -1012,15 +1076,14 @@ def main() -> None:
                         plan.stop_loss
                     )
 
-
                 # refresh cached position after submit
                 open_position = get_position_safe()
 
                 _notional = qty * entry
                 print(f"{human_ts(now_utc_iso())} " + R.good(f"entered {side.upper()} {cfg.symbol} @ {entry:.4f} qty={qty} tp={plan.take_profit:.4f} sl={plan.stop_loss:.4f} notional=${_notional:.2f} (order_id={order_id})"))
 
-            # If we had an entry signal but were blocked by an existing position, emit a diagnostic once.
             elif action in ("enter_long", "enter_short") and not _can_enter:
+                # If we had an entry signal but were blocked by an existing position, emit a diagnostic once.
                 try:
                     _oq = float(getattr(open_position, "qty", 0.0) or 0.0)
                 except Exception:
@@ -1061,6 +1124,7 @@ def format_header(cfg: Config, broker: BrokerBase, current_price: float = None, 
         kv.append(R.kv("TP", f"${_plan.take_profit:.2f} ({cfg.tp_pct:.2f}%)"))
         kv.append(R.kv("SL", f"${_plan.stop_loss:.2f} ({cfg.sl_pct:.2f}%)"))
     return "  ".join(kv)
+
 
 if __name__ == "__main__":
     main()
