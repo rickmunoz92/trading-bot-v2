@@ -6,6 +6,7 @@ import time
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import os
 try:
     from zoneinfo import ZoneInfo
 except Exception:
@@ -29,6 +30,44 @@ if not hasattr(R, 'good'):
 
 from strategies import StrategyBase, get_strategy
 from adapters import BrokerBase, LocalPaperBroker, make_broker
+
+
+# ---- CSV header enforcement (idempotent) ----
+def ensure_csv_headers(symbol: str) -> None:
+    """Ensure <SYMBOL>.csv has a canonical header. If the file exists
+    and is non-empty but missing a header, prepend one once."""
+    header = [
+        "Entry Date","Entry Time","Exit Date","Exit Time","Symbol",
+        "Asset Class","Strategy/Setup","Entry Price","Stop Loss",
+        "Take Profit","Exit Price","Position Size","Result (Win/Loss)",
+        "PnL ($)","PnL (%)","Notes"
+    ]
+    path = f"{symbol}.csv"
+    try:
+        if not os.path.exists(path):
+            with open(path, "w", encoding="utf-8") as wf:
+                wf.write(",".join(header) + "\n")
+            return
+        with open(path, "r", encoding="utf-8") as rf:
+            lines = rf.readlines()
+        if not lines:
+            with open(path, "w", encoding="utf-8") as wf:
+                wf.write(",".join(header) + "\n")
+            return
+        first_non_empty_idx = next((i for i, line in enumerate(lines) if line.strip()), None)
+        if first_non_empty_idx is None:
+            with open(path, "w", encoding="utf-8") as wf:
+                wf.write(",".join(header) + "\n")
+            return
+        first = lines[first_non_empty_idx].strip()
+        if not first.startswith("Entry Date,Entry Time"):
+            lines.insert(first_non_empty_idx, ",".join(header) + "\n")
+            with open(path, "w", encoding="utf-8") as wf:
+                wf.writelines(lines)
+    except Exception:
+        # ignore any filesystem errors; journaling shouldn't break trading
+        pass
+
 
 
 # ------------------------------- Data classes -------------------------------
@@ -360,6 +399,10 @@ def main() -> None:
             responsive_sleep(remaining)
 
     journal = Journal(symbol=cfg.symbol)
+    try:
+        ensure_csv_headers(cfg.symbol)
+    except Exception:
+        pass
 
     tf_secs = _parse_timeframe_seconds(cfg.timeframe)
     last_bucket_sec: Optional[int] = None
@@ -555,25 +598,36 @@ def main() -> None:
             except Exception as e:
                 print(R.warn(f"close_position failed during reconcile: {e}"))
                 return pos
-            journal.on_exit(
-                when=now_utc_iso(),
-                exit_price=exit_price,
-                win_loss=("Win" if pnl_abs >= 0 else "Loss"),
-                pnl_abs=pnl_abs,
-                pnl_pct=pnl_pct,
-            )
+            # Journal with optional notes (TP/SL)
+            try:
+                journal.on_exit(
+                    when=now_utc_iso(),
+                    exit_price=exit_price,
+                    win_loss=("Win" if pnl_abs >= 0 else "Loss"),
+                    pnl_abs=pnl_abs,
+                    pnl_pct=pnl_pct,
+                    notes=hit.upper()
+                )
+            except TypeError:
+                journal.on_exit(now_utc_iso(), exit_price, "Win" if pnl_abs >= 0 else "Loss", pnl_abs, pnl_pct)
             return None
         return pos
 
-    def _enforce_tp_sl_and_maybe_exit(cfg: Config, broker: BrokerBase, journal: Journal, open_position) -> Optional[Dict[str, Any]]:
+    def _enforce_tp_sl_and_maybe_exit(cfg: Config, broker: BrokerBase, journal: Journal, open_position) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        Enforce TP/SL against the current price and close the position if breached.
+        Returns (new_open_position, exit_info) where:
+          - new_open_position is None if we closed, else the unchanged position
+          - exit_info is a dict like {'reason': 'tp'|'sl', 'pnl_abs': float, 'pnl_pct': float}
+        """
         if not open_position:
-            return None
+            return None, None
         avg = float(getattr(open_position, 'avg_price', 0.0))
         if avg <= 0:
-            return open_position
+            return open_position, None
         price, _src = price_fetch()
         if price is None:
-            return open_position
+            return open_position, None
         side = _infer_side_from_position(open_position)
         tp = avg * (1 + cfg.tp_pct / 100.0) if side == "long" else avg * (1 - cfg.tp_pct / 100.0)
         sl = avg * (1 - cfg.sl_pct / 100.0) if side == "long" else avg * (1 + cfg.sl_pct / 100.0)
@@ -589,16 +643,21 @@ def main() -> None:
                 )
             except Exception as e:
                 print(R.warn(f"close_position failed: {e}"))
-                return open_position
-            journal.on_exit(
-                when=now_utc_iso(),
-                exit_price=exit_price,
-                win_loss=("Win" if pnl_abs >= 0 else "Loss"),
-                pnl_abs=pnl_abs,
-                pnl_pct=pnl_pct
-            )
-            return None
-        return open_position
+                return open_position, None
+            # Journal with optional notes (TP/SL)
+            try:
+                journal.on_exit(
+                    when=now_utc_iso(),
+                    exit_price=exit_price,
+                    win_loss=("Win" if pnl_abs >= 0 else "Loss"),
+                    pnl_abs=pnl_abs,
+                    pnl_pct=pnl_pct,
+                    notes=hit.upper()
+                )
+            except TypeError:
+                journal.on_exit(now_utc_iso(), exit_price, "Win" if pnl_abs >= 0 else "Loss", pnl_abs, pnl_pct)
+            return None, {"reason": hit, "pnl_abs": pnl_abs, "pnl_pct": pnl_pct}
+        return open_position, None
 
     # --- Startup reconcile
     open_position = _reconcile_on_start(cfg, broker, journal)
@@ -725,18 +784,23 @@ def main() -> None:
 
             # ---------- Enforce TP/SL before strategy ----------
             if open_position:
-                updated = _enforce_tp_sl_and_maybe_exit(cfg, broker, journal, open_position)
+                updated, exit_info = _enforce_tp_sl_and_maybe_exit(cfg, broker, journal, open_position)
                 open_position = updated
                 if not open_position:
+                    # Build header & detailed exit line (with reason + PnL)
                     header_line = f"{human_ts(now_utc_iso())} " + format_header(
                         cfg, broker, current_price=display_price, action=action,
                         strategy_state=getattr(strategy, "debug_state", lambda: {})()
-                        )
+                    )
+                    reason = (exit_info or {}).get("reason", "tp/sl")
+                    pnl_abs = (exit_info or {}).get("pnl_abs", 0.0)
+                    pnl_pct = (exit_info or {}).get("pnl_pct", 0.0)
+                    reason_str = "tp" if reason == "tp" else ("sl" if reason == "sl" else "tp/sl")
                     line = [
                         R.kv("price", f"{display_price:.4f}"),
-                R.kv("src", price_src),
-                        R.kv("sig", "exit (tp/sl)"),
-                        R.kv("hit", "n/a"),
+                        R.kv("src", price_src),
+                        R.kv("sig", f"exit ({reason_str})"),
+                        R.kv("pnl", f"${pnl_abs:.2f} ({pnl_pct:+.2f}%)"),
                     ]
                     print(f"{header_line} | " + " ".join(line))
                     pace_sleep(loop_start, cfg.poll)
