@@ -18,6 +18,7 @@ ET = ZoneInfo('America/New_York')
 from typing import Optional, Dict, Any, Tuple, Callable, List
 import random
 from queue import Queue, Empty
+from types import SimpleNamespace
 
 from io_utils import R, Journal
 # Backward-compatibility: some io_utils versions don't define R.good
@@ -45,22 +46,22 @@ def ensure_csv_headers(symbol: str) -> None:
     try:
         if not os.path.exists(path):
             with open(path, "w", encoding="utf-8") as wf:
-                wf.write(",".join(header) + "\n")
+                wf.write(",".join(header) + "\\n")
             return
         with open(path, "r", encoding="utf-8") as rf:
             lines = rf.readlines()
         if not lines:
             with open(path, "w", encoding="utf-8") as wf:
-                wf.write(",".join(header) + "\n")
+                wf.write(",".join(header) + "\\n")
             return
         first_non_empty_idx = next((i for i, line in enumerate(lines) if line.strip()), None)
         if first_non_empty_idx is None:
             with open(path, "w", encoding="utf-8") as wf:
-                wf.write(",".join(header) + "\n")
+                wf.write(",".join(header) + "\\n")
             return
         first = lines[first_non_empty_idx].strip()
         if not first.startswith("Entry Date,Entry Time"):
-            lines.insert(first_non_empty_idx, ",".join(header) + "\n")
+            lines.insert(first_non_empty_idx, ",".join(header) + "\\n")
             with open(path, "w", encoding="utf-8") as wf:
                 wf.writelines(lines)
     except Exception:
@@ -85,6 +86,15 @@ class Config:
     fast: int
     slow: int
     side: Optional[str]  # "long" | "short" | "both" | None
+    # ---- AI Co-Pilot flags ----
+    ai_co_pilot: bool = False
+    confidence_threshold: float = 0.70
+    always_use_ai: bool = False
+    no_learning: bool = False
+    reset_memory: bool = False
+    weights: Optional[str] = None
+    simulate: Optional[str] = None
+    debug: bool = False
 
 
 @dataclass
@@ -140,7 +150,7 @@ def human_ts(ts: str) -> str:
 def fmt_mt(dt: datetime) -> str:
     dt_mt = dt.astimezone(MT)
     s = dt_mt.strftime("%a %b %d @ %I:%M%p").replace("AM","am").replace("PM","pm")
-    s = re.sub(r"@ 0(\d):", r"@ \1:", s)
+    s = re.sub(r"@ 0(\d):", r"@ \\1:", s)
     return f"{s} MT"
 
 
@@ -164,6 +174,18 @@ def parse_args() -> Config:
     p.add_argument("--slow", type=int, default=21, help="ema slow period")
     p.add_argument("--side", choices=["long", "short", "both"], default=None,
                    help="Restrict trades: long only, short only, or both. Default: equities=both, crypto=long.")
+
+    # ---- AI Co-Pilot flags ----
+    p.add_argument("--ai-co-pilot", action="store_true", default=False, help="enable AI co-pilot filter")
+    p.add_argument("--confidence-threshold", type=float, default=0.70, help="co-pilot decision threshold")
+    p.add_argument("--always-use-ai", action="store_true", default=False, help="run AI every poll (not just on signals)")
+    p.add_argument("--no-learning", action="store_true", default=False, help="disable adaptive learning")
+    p.add_argument("--reset-memory", action="store_true", default=False, help="reset co-pilot memory and exit")
+    p.add_argument("--weights", type=str,
+                   default="regime=0.30,events=0.20,sentiment=0.15,xasset=0.15,risk=0.10,llm=0.10",
+                   help="override weights as comma-separated key=val pairs")
+    p.add_argument("--simulate", type=str, default=None, help="simulate backtest on given symbol logs (stub)")
+    p.add_argument("--debug", action="store_true", default=False, help="verbose console output")
 
     a = p.parse_args()
     if isinstance(a.strategy, list):
@@ -189,6 +211,14 @@ def parse_args() -> Config:
         fast=a.fast,
         slow=a.slow,
         side=a.side,
+        ai_co_pilot=a.ai_co_pilot,
+        confidence_threshold=a.confidence_threshold,
+        always_use_ai=a.always_use_ai,
+        no_learning=a.no_learning,
+        reset_memory=a.reset_memory,
+        weights=a.weights,
+        simulate=a.simulate,
+        debug=a.debug,
     )
 
 
@@ -245,7 +275,7 @@ def _apply_side_filter(action: str, side_pref: str) -> str:
     return action
 
 
-_TF_RE = re.compile(r"^\s*(\d+)\s*([mhd])\s*$", re.IGNORECASE)
+_TF_RE = re.compile(r"^\\s*(\\d+)\\s*([mhd])\\s*$", re.IGNORECASE)
 
 def _parse_timeframe_seconds(tf: str) -> int:
     m = _TF_RE.match(tf or "")
@@ -374,6 +404,18 @@ def _retry_broker(
 
 def main() -> None:
     cfg = parse_args()
+
+    # Early handling of AI memory reset / simulate (non-breaking if module missing)
+    if cfg.reset_memory:
+        try:
+            import ai_copilot  # type: ignore
+            ai_copilot.reset_memory()
+        except Exception as e:
+            print(R.warn(f"AI Co-Pilot reset requested but module not available: {e}"))
+        return
+    if cfg.simulate:
+        print(R.dim(f"Simulation stub for {cfg.simulate}: not implemented in app.py (use ai_copilot.py backtester if provided)."))
+        return
 
     strategy: StrategyBase = get_strategy(cfg.strategy_name)(fast=cfg.fast, slow=cfg.slow)
 
@@ -989,6 +1031,54 @@ def main() -> None:
                 R.kv("hit", "yes" if _strategy_hit(action) else "no"),
             ]
             print(f"{header_line} | " + " ".join(line))
+
+            # --- AI Co-Pilot evaluation (filter) ---
+            if cfg.ai_co_pilot or cfg.always_use_ai:
+                try:
+                    import ai_copilot  # type: ignore
+                    # Build a thin args object compatible with CopilotConfig
+                    args_ns = SimpleNamespace(
+                        confidence_threshold=cfg.confidence_threshold,
+                        weights=cfg.weights,
+                        debug=cfg.debug
+                    )
+                    cop_cfg = ai_copilot.CopilotConfig(args=args_ns)
+                    # If user requested to disable learning, reflect that
+                    if cfg.no_learning:
+                        try:
+                            cop_cfg.learning_enabled = False  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    context = {
+                        "symbol": cfg.symbol,
+                        "timeframe": cfg.timeframe,
+                        "bars": latest_bars or [],
+                        "events": [],        # placeholder; integrate real calendar if available
+                        "sentiment": {},     # placeholder for funding/OI sentiment
+                        "correlations": {},  # placeholder for cross-asset snapshot
+                        "risk": {}           # placeholder for portfolio/risk context
+                    }
+                    # Only gate entries by default; if always_use_ai, still run for visibility
+                    run_ai = cfg.always_use_ai or action in ("enter_long", "enter_short")
+                    if run_ai:
+                        decision = ai_copilot.evaluate(sig_obj, context, cop_cfg)
+                        # Print detailed breakdown
+                        for name, info in (decision.get("filter_breakdown") or {}).items():
+                            try:
+                                print(f"{name}: score={info['score']:.2f}, weight={info['weight']:.2f}, contrib={info['contrib']:.2f}")
+                            except Exception:
+                                print(f"{name}: {info}")
+                        print(f"AI confidence={decision.get('confidence',0.0):.2f} threshold={cfg.confidence_threshold:.2f} decision={'APPROVE' if decision.get('approved') else 'BLOCK'}")
+                        if decision.get("reasoning"):
+                            print("AI reasoning:", decision["reasoning"])
+                        if decision.get("layman_explanation"):
+                            print("AI layman:", decision["layman_explanation"])
+                        if (action in ('enter_long','enter_short')) and not decision.get("approved", False):
+                            print(R.warn("AI Co-Pilot declined trade signal; skipping entry."))
+                            pace_sleep(loop_start, cfg.poll)
+                            continue
+                except Exception as e:
+                    print(R.warn(f"AI Co-Pilot unavailable or failed: {e} — proceeding without AI gating."))
 
             # --- Execute (budgeted retry) ---
             # Treat tiny/zero-qty positions as flat (some brokers can briefly report qty=0)
