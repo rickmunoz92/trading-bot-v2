@@ -1,2 +1,11 @@
 # Local environment variables
 .env.env
+# Local env
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Virtualenv
+.venv/
